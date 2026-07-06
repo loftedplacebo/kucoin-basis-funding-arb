@@ -30,10 +30,23 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     while True:
-        result = run_paper_strategy_once(DEFAULT_CONFIG, opportunity_path=args.opportunities)
-        print(f"Processed {result['opportunities_seen']} opportunities from {result['opportunity_file']}")
-        print(f"Entries opened: {result['entries_opened']}")
-        print(f"Open positions: {result['open_positions']}")
+        try:
+            result = run_paper_strategy_once(DEFAULT_CONFIG, opportunity_path=args.opportunities)
+        except SystemExit as error:
+            if not args.loop:
+                raise
+            print(f"Paper strategy waiting: {error}", flush=True)
+        except Exception as error:
+            if not args.loop:
+                raise
+            print(f"Paper strategy error: {type(error).__name__}: {error}", flush=True)
+        else:
+            print(
+                f"Processed {result['opportunities_seen']} opportunities from {result['opportunity_file']}",
+                flush=True,
+            )
+            print(f"Entries opened: {result['entries_opened']}", flush=True)
+            print(f"Open positions: {result['open_positions']}", flush=True)
         if not args.loop:
             return
         time.sleep(args.interval)
