@@ -71,6 +71,14 @@ data/kucoin_basis/
 
 That directory is intentionally ignored by git.
 
+Useful audit files:
+
+- `data/kucoin_basis/scanner_runs.csv`: one row per scanner pass, including failures and elapsed time.
+- `data/kucoin_basis/opportunities/kucoin_basis_opportunities_YYYYMMDD.csv`: every scanner chunk row with `decision` and `reason`.
+- `data/kucoin_basis/paper/decisions.csv`: every paper entry/exit decision with allow/deny reason.
+- `data/kucoin_basis/paper/fills.csv`: paper opens, adds, partial closes, and closes.
+- `data/kucoin_basis/paper/funding_events.csv`: booked funding events.
+
 ## Tests
 
 ```powershell
