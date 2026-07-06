@@ -41,10 +41,31 @@ python kucoin_basis\print_summary.py
 
 ## VPS Dashboard Access
 
-On the VPS, bind the dashboard to localhost:
+Clone the repo on the VPS:
 
-```powershell
-python kucoin_basis\run_funding_dashboard.py --host 127.0.0.1 --port 8766
+```bash
+git clone https://github.com/loftedplacebo/kucoin-basis-funding-arb.git
+cd kucoin-basis-funding-arb
+```
+
+Install and start the `systemd` services:
+
+```bash
+bash scripts/install_systemd_services.sh
+```
+
+This starts and auto-restarts:
+
+- `kucoin-basis-scanner`
+- `kucoin-basis-strategy`
+- `kucoin-basis-dashboard`
+
+The dashboard binds to `127.0.0.1:8766` on the VPS.
+
+Check service health:
+
+```bash
+bash scripts/vps_status.sh
 ```
 
 From your local machine, tunnel it:
