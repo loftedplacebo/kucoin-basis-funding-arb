@@ -6,6 +6,11 @@ APP_USER="${KUCOIN_BASIS_USER:-$(id -un)}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 DASHBOARD_HOST="${DASHBOARD_HOST:-127.0.0.1}"
 DASHBOARD_PORT="${DASHBOARD_PORT:-8766}"
+if command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+else
+  SUDO=""
+fi
 
 cd "$APP_DIR"
 
@@ -18,7 +23,7 @@ write_service() {
   local description="$2"
   local command="$3"
 
-  sudo tee "/etc/systemd/system/${name}.service" >/dev/null <<SERVICE
+  ${SUDO} tee "/etc/systemd/system/${name}.service" >/dev/null <<SERVICE
 [Unit]
 Description=${description}
 After=network-online.target
@@ -53,11 +58,11 @@ write_service \
   "KuCoin basis local dashboard" \
   "kucoin_basis/run_funding_dashboard.py --host ${DASHBOARD_HOST} --port ${DASHBOARD_PORT}"
 
-sudo systemctl daemon-reload
-sudo systemctl enable kucoin-basis-scanner kucoin-basis-strategy kucoin-basis-dashboard
-sudo systemctl restart kucoin-basis-scanner kucoin-basis-strategy kucoin-basis-dashboard
+${SUDO} systemctl daemon-reload
+${SUDO} systemctl enable kucoin-basis-scanner kucoin-basis-strategy kucoin-basis-dashboard
+${SUDO} systemctl restart kucoin-basis-scanner kucoin-basis-strategy kucoin-basis-dashboard
 
-sudo systemctl --no-pager --full status \
+${SUDO} systemctl --no-pager --full status \
   kucoin-basis-scanner \
   kucoin-basis-strategy \
   kucoin-basis-dashboard
