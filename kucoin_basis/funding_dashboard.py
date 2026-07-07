@@ -5,7 +5,7 @@ import csv
 import json
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -245,6 +245,23 @@ HTML = """<!doctype html>
       border-radius: 8px;
       display: none;
     }
+    .alerts {
+      display: none;
+      margin: 0 0 14px;
+      gap: 8px;
+    }
+    .alerts.visible {
+      display: grid;
+    }
+    .alert {
+      border: 1px solid #d8aa54;
+      background: #fff8e8;
+      color: #6d4600;
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 13px;
+      box-shadow: var(--shadow);
+    }
     .chunk-cell { display: none; }
     #shortlistSection.show-chunks .chunk-cell { display: table-cell; }
     @media (max-width: 720px) {
@@ -278,6 +295,7 @@ HTML = """<!doctype html>
   </header>
   <main>
     <div id="error" class="error"></div>
+    <div id="alerts" class="alerts"></div>
     <section id="fundingSection" class="tab-section">
       <div class="table-wrap">
       <table>
@@ -352,6 +370,7 @@ HTML = """<!doctype html>
               <th>Current basis</th>
               <th>Basis improvement</th>
               <th>Realised funding</th>
+              <th>Funding cover</th>
               <th>Basis PnL</th>
               <th>Net PnL</th>
               <th>Next funding</th>
@@ -417,6 +436,7 @@ HTML = """<!doctype html>
     const summaryReasonsEl = document.getElementById("summaryReasons");
     const statusEl = document.getElementById("status");
     const errorEl = document.getElementById("error");
+    const alertsEl = document.getElementById("alerts");
     const filterEl = document.getElementById("filter");
     const shortlistFilterEl = document.getElementById("shortlistFilter");
     const toggleChunksEl = document.getElementById("toggleChunks");
@@ -442,6 +462,11 @@ HTML = """<!doctype html>
     function fmtMoney(value) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "";
       return `$${Number(value).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    }
+
+    function fmtRatio(value) {
+      if (value === null || value === undefined || value === "" || Number.isNaN(Number(value))) return "";
+      return `${Number(value).toFixed(2)}x`;
     }
 
     function fmtDateTime(value, includeSeconds = false) {
@@ -471,6 +496,21 @@ HTML = """<!doctype html>
       return "muted";
     }
 
+    function renderAlerts(alerts = []) {
+      alertsEl.innerHTML = "";
+      if (!alerts.length) {
+        alertsEl.classList.remove("visible");
+        return;
+      }
+      for (const alert of alerts) {
+        const div = document.createElement("div");
+        div.className = "alert";
+        div.textContent = alert.message || "";
+        alertsEl.appendChild(div);
+      }
+      alertsEl.classList.add("visible");
+    }
+
     function displayDirection(value) {
       if (value === "SHORT_SPOT_LONG_PERP") return "Short spot / long perp";
       if (value === "LONG_SPOT_SHORT_PERP") return "Long spot / short perp";
@@ -491,6 +531,15 @@ HTML = """<!doctype html>
         max_total_exposure: "total cap",
         max_open_positions: "position cap",
         full_position_close_liquidity_missing: "close liquidity missing",
+        hold_basis_moved_adversely: "hold: basis adverse",
+        hold_for_next_profitable_funding: "hold: funding good",
+        funding_captured_next_funding_below_threshold: "next funding weak",
+        funding_weak_basis_adverse_try_unwind: "weak funding: try unwind",
+        exit_wanted_no_profitable_chunk: "exit wanted: no good chunk",
+        basis_too_volatile_no_entry: "basis too volatile",
+        basis_too_volatile_no_add: "basis adverse: no add",
+        volatility_cooldown: "cooldown",
+        no_fresh_market_row: "no fresh market row",
       };
       return labels[value] || value || "";
     }
@@ -627,6 +676,7 @@ HTML = """<!doctype html>
           <td>${fmtPct(position.current_basis_pct)}</td>
           <td class="${improvement >= 0 ? "positive" : "negative"}">${fmtPct(improvement)}</td>
           <td>${fmtMoney(position.realised_funding_pnl_usd)}</td>
+          <td>${fmtRatio(position.funding_coverage_ratio)}</td>
           <td>${fmtMoney(position.unrealised_basis_pnl_usd)}</td>
           <td class="${pnl >= 0 ? "positive" : "negative"}">${fmtMoney(pnl)}</td>
           <td>${dateCell(position.next_funding_time)}</td>
@@ -662,6 +712,9 @@ HTML = """<!doctype html>
         ["Funding PnL today", fmtMoney(summaryPayload.realisedFundingPnlTodayUsd)],
         ["Total PnL today", fmtMoney(summaryPayload.realisedTotalPnlTodayUsd)],
         ["Funding events today", summaryPayload.fundingEventsCapturedToday],
+        ["Entry funding min", fmtPct(summaryPayload.entryFundingMinPct)],
+        ["Hold funding min", fmtPct(summaryPayload.holdFundingMinPct)],
+        ["Active cooldowns", summaryPayload.activeCooldowns],
         ["Shortlist rows", summaryPayload.shortlistRows],
         ["Entry candidates", summaryPayload.entryCandidates],
       ];
@@ -706,6 +759,7 @@ HTML = """<!doctype html>
         if (!response.ok) throw new Error(payload.error || response.statusText);
         items = payload.items || [];
         statusEl.textContent = `${items.length} active USDT perps with spot pairs loaded at ${fmtDateTime(payload.observedAtUtc, true)}`;
+        renderAlerts([]);
         render();
       } catch (error) {
         errorEl.textContent = error.message;
@@ -724,6 +778,7 @@ HTML = """<!doctype html>
         shortlistItems = payload.items || [];
         shortlistRawItems = payload.rawItems || [];
         shortlistRawRowCount = payload.rawRowCount || shortlistRawItems.length;
+        renderAlerts([]);
         renderShortlist();
       } catch (error) {
         errorEl.textContent = error.message;
@@ -741,6 +796,7 @@ HTML = """<!doctype html>
         if (!response.ok) throw new Error(payload.error || response.statusText);
         positionsPayload = payload;
         statusEl.textContent = `${(payload.positions || []).length} paper positions loaded at ${fmtDateTime(payload.observedAtUtc, true)}`;
+        renderAlerts(payload.alerts || []);
         renderPositions();
       } catch (error) {
         errorEl.textContent = error.message;
@@ -758,6 +814,7 @@ HTML = """<!doctype html>
         if (!response.ok) throw new Error(payload.error || response.statusText);
         summaryPayload = payload;
         statusEl.textContent = `Summary loaded at ${fmtDateTime(payload.observedAtUtc, true)}`;
+        renderAlerts(payload.alerts || []);
         renderSummary();
       } catch (error) {
         errorEl.textContent = error.message;
@@ -1069,6 +1126,80 @@ def load_shortlist_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     }
 
 
+def _dashboard_alerts(all_positions, fills: list[dict], decisions: list[dict], now: datetime) -> list[dict]:
+    alerts = []
+    overdue_positions = [
+        position
+        for position in all_positions
+        if position.status == "OPEN"
+        and position.next_funding_time is not None
+        and position.next_funding_time <= now
+    ]
+    if overdue_positions:
+        labels = ", ".join(
+            f"{position.base} {position.direction}"
+            for position in overdue_positions[:5]
+        )
+        extra = "" if len(overdue_positions) <= 5 else f" +{len(overdue_positions) - 5} more"
+        alerts.append({
+            "type": "funding_overdue",
+            "message": f"{len(overdue_positions)} open position(s) have overdue funding timestamps: {labels}{extra}.",
+        })
+
+    recent_cutoff = now - timedelta(hours=1)
+    hard_exits = []
+    entries = []
+    for fill in fills:
+        timestamp = parse_datetime(fill.get("timestamp_utc"))
+        if timestamp is None or timestamp < recent_cutoff:
+            continue
+        event_type = fill.get("event_type", "")
+        key = (fill.get("base", ""), fill.get("direction", ""))
+        if fill.get("reason") == "basis_moved_adversely" and event_type in {"CLOSE_POSITION", "PARTIAL_CLOSE"}:
+            hard_exits.append((timestamp, key))
+        elif event_type in {"OPEN_POSITION", "ADD_POSITION"}:
+            entries.append((timestamp, key))
+    reentered = sorted({
+        key
+        for exit_time, key in hard_exits
+        for entry_time, entry_key in entries
+        if key == entry_key and entry_time > exit_time
+    })
+    if reentered:
+        labels = ", ".join(f"{base} {direction}" for base, direction in reentered[:5])
+        extra = "" if len(reentered) <= 5 else f" +{len(reentered) - 5} more"
+        alerts.append({
+            "type": "hard_stop_reentry",
+            "message": f"Recent basis hard-stop re-entry detected: {labels}{extra}.",
+        })
+    latest_exit_reason = {}
+    for decision in decisions:
+        if decision.get("decision_type") == "EXIT":
+            latest_exit_reason[decision.get("position_id", "")] = decision.get("reason", "")
+    dead_carry = [
+        position
+        for position in all_positions
+        if position.status == "OPEN"
+        and position.funding_events_captured >= 2
+        and latest_exit_reason.get(position.position_id) in {
+            "funding_weak_basis_adverse_try_unwind",
+            "exit_wanted_no_profitable_chunk",
+            "funding_captured_next_funding_below_threshold",
+        }
+    ]
+    if dead_carry:
+        labels = ", ".join(
+            f"{position.base} {position.direction}"
+            for position in dead_carry[:5]
+        )
+        extra = "" if len(dead_carry) <= 5 else f" +{len(dead_carry) - 5} more"
+        alerts.append({
+            "type": "dead_carry_warning",
+            "message": f"{len(dead_carry)} open position(s) have weak funding after multiple funding events: {labels}{extra}.",
+        })
+    return alerts
+
+
 def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     store = PaperStore(config)
     now = datetime.now(timezone.utc)
@@ -1090,10 +1221,17 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         else:
             basis_improvement = position.entry_basis_pct - position.current_basis_pct
         expected_funding_pnl = position.notional_usd * position.expected_funding_pct / 100
+        basis_loss = abs(position.unrealised_basis_pnl_usd) if position.unrealised_basis_pnl_usd < 0 else 0.0
+        funding_coverage_ratio = (
+            position.realised_funding_pnl_usd / basis_loss
+            if basis_loss > 0
+            else None
+        )
         funding_due = position.next_funding_time is not None and position.next_funding_time <= now
         row["basis_improvement_pct"] = f"{basis_improvement:.8f}"
         row["age_label"] = _age_label(position.created_at, now)
         row["expected_funding_pnl_usd"] = f"{expected_funding_pnl:.8f}"
+        row["funding_coverage_ratio"] = "" if funding_coverage_ratio is None else f"{funding_coverage_ratio:.8f}"
         row["funding_due"] = str(funding_due)
         if funding_due:
             row["funding_state"] = "funding due"
@@ -1112,6 +1250,7 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     return {
         "observedAtUtc": datetime.now(timezone.utc).isoformat(),
         "maxSymbolNotionalUsd": config.max_symbol_notional_usd,
+        "alerts": _dashboard_alerts(all_positions, fills, decisions, now),
         "positions": positions,
         "recentFills": fills[:25],
     }
@@ -1125,6 +1264,7 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     fills = _load_csv(store.fills_path)
     funding_events = _load_csv(store.funding_events_path)
     decisions = _load_csv(store.decisions_path)
+    active_cooldowns = store.load_active_cooldowns(now)
     latest_path, latest_rows = _latest_opportunity_rows(config)
 
     realised_funding_today = sum(
@@ -1157,10 +1297,14 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         "realisedTradePnlTodayUsd": realised_trade_today,
         "realisedTotalPnlTodayUsd": realised_funding_today + realised_trade_today,
         "fundingEventsCapturedToday": sum(1 for row in funding_events if _is_today(row, "timestamp_utc", now)),
+        "entryFundingMinPct": config.min_funding_rate_pct,
+        "holdFundingMinPct": config.min_hold_funding_rate_pct,
+        "activeCooldowns": len(active_cooldowns),
         "shortlistRows": len(latest_rows),
         "entryCandidates": sum(1 for row in latest_rows if row.get("decision") == "ENTER_CANDIDATE"),
         "entryRejections": entry_rejections.most_common(10),
         "exitReasons": exit_reasons.most_common(10),
+        "alerts": _dashboard_alerts(positions, fills, decisions, now),
     }
 
 

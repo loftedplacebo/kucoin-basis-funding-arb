@@ -1,9 +1,13 @@
+import csv
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta, timezone
 
 from kucoin_basis.config import KucoinBasisConfig
-from kucoin_basis.models import OpportunityRow
+from kucoin_basis.models import OpportunityRow, parse_float
 from kucoin_basis.paper_models import PaperPosition
-from kucoin_basis.paper_strategy import _choose_partial_close
+from kucoin_basis.paper_store import PaperStore
+from kucoin_basis.paper_strategy import _accrue_funding_if_crossed, _choose_partial_close, _should_exit, run_paper_strategy_once
 
 
 def make_position(**overrides):
@@ -67,7 +71,30 @@ def make_row(notional_usd: float, spot_exit_slippage_pct: float, perp_exit_slipp
         perp_entry_avg_price=100.0,
         spot_exit_avg_price=99.9,
         perp_exit_avg_price=100.1,
+        funding_interval=1.0,
     )
+
+
+def make_config(root: Path) -> KucoinBasisConfig:
+    return KucoinBasisConfig(
+        data_dir=root / "data",
+        opportunities_dir=root / "data" / "opportunities",
+        paper_dir=root / "data" / "paper",
+        archive_dir=root / "data" / "archive",
+    )
+
+
+def write_opportunities(path: Path, rows: list[OpportunityRow]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    csv_rows = [row.to_csv_row() for row in rows]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+
+def replace_row(row: OpportunityRow, **overrides) -> OpportunityRow:
+    return OpportunityRow(**{**row.__dict__, **overrides})
 
 
 def test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage():
@@ -95,6 +122,236 @@ def test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage():
     assert estimate.net_pnl_pct > 0
 
 
+def test_funding_accrues_without_current_opportunity_row():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            next_funding_time=datetime.now(timezone.utc) - timedelta(minutes=90),
+            funding_interval_hours=1.0,
+            funding_events_captured=0,
+        )
+
+        _accrue_funding_if_crossed(position, None, store, config)
+
+        assert position.funding_events_captured == 2
+        assert position.next_funding_time is not None
+        assert position.next_funding_time > datetime.now(timezone.utc)
+        with store.funding_events_path.open("r", newline="", encoding="utf-8") as f:
+            events = list(csv.DictReader(f))
+        assert len(events) == 2
+        assert sum(parse_float(row["funding_pnl_usd"], 0.0) or 0.0 for row in events) == 5.0
+
+
+def test_add_position_fill_logs_added_chunk_not_running_total():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        first_path = config.opportunities_dir / "kucoin_basis_opportunities_1.csv"
+        second_path = config.opportunities_dir / "kucoin_basis_opportunities_2.csv"
+        first_row = make_row(100.0, 0.01, 0.01)
+        second_row = make_row(250.0, 0.01, 0.01)
+        second_row = OpportunityRow(
+            **{
+                **second_row.__dict__,
+                "timestamp_utc": second_row.timestamp_utc + timedelta(minutes=1),
+            }
+        )
+        write_opportunities(first_path, [first_row])
+        write_opportunities(second_path, [second_row])
+
+        run_paper_strategy_once(config, first_path)
+        run_paper_strategy_once(config, second_path)
+
+        store = PaperStore(config)
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        assert [row["event_type"] for row in fills] == ["OPEN_POSITION", "ADD_POSITION"]
+        assert parse_float(fills[0]["notional_usd"]) == 100.0
+        assert parse_float(fills[1]["notional_usd"]) == 250.0
+
+
+def test_stale_close_row_is_not_used_for_exit_decision():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            entry_basis_pct=-5.0,
+            current_basis_pct=-5.0,
+            funding_events_captured=0,
+            next_funding_time=now + timedelta(hours=1),
+        )
+        store.write_positions({position.position_id: position})
+
+        stale_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(hours=5),
+            basis_pct=-21.0,
+            decision="REJECT",
+            reason="basis_not_low_enough_for_short_spot",
+            spot_exit_avg_price=11.345276256058835,
+            perp_exit_avg_price=8.953380744056894,
+        )
+        fresh_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            basis_pct=-5.5,
+            decision="REJECT",
+            reason="expected_edge_below_threshold",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [stale_row, fresh_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        positions = store.load_open_positions()
+        assert position.position_id in positions
+        fills = []
+        if store.fills_path.exists():
+            with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+                fills = list(csv.DictReader(f))
+        assert not any(row["event_type"] == "CLOSE_POSITION" for row in fills)
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decisions = [row for row in decisions if row["decision_type"] == "EXIT"]
+        assert exit_decisions
+        assert exit_decisions[-1]["opportunity_key"] == fresh_row.opportunity_key
+        assert exit_decisions[-1]["reason"] == "hold_until_first_funding"
+
+
+def test_adverse_basis_holds_instead_of_hard_exit():
+    config = KucoinBasisConfig(max_basis_adverse_move_pct=5.0)
+    position = make_position(
+        entry_basis_pct=-5.0,
+        current_basis_pct=-11.1,
+        funding_events_captured=0,
+    )
+
+    should_exit, reason = _should_exit(position, make_row(500.0, 0.01, 0.01), config)
+
+    assert should_exit is False
+    assert reason == "hold_basis_moved_adversely"
+
+
+def test_next_funding_above_hold_threshold_overrides_basis_take_profit():
+    config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30)
+    position = make_position(
+        entry_basis_pct=-5.0,
+        current_basis_pct=-4.0,
+        funding_events_captured=1,
+        estimated_net_pnl_usd=10.0,
+    )
+    row = replace_row(make_row(500.0, 0.01, 0.01), funding_rate_pct=-0.5)
+
+    should_exit, reason = _should_exit(position, row, config)
+
+    assert should_exit is False
+    assert reason == "hold_for_next_profitable_funding"
+
+
+def test_adverse_basis_with_weak_funding_tries_profitable_unwind():
+    config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30)
+    position = make_position(
+        entry_basis_pct=-5.0,
+        current_basis_pct=-11.1,
+        funding_events_captured=1,
+    )
+    row = replace_row(make_row(500.0, 0.01, 0.01), funding_rate_pct=-0.1)
+
+    should_exit, reason = _should_exit(position, row, config)
+
+    assert should_exit is True
+    assert reason == "funding_weak_basis_adverse_try_unwind"
+
+
+def test_adverse_basis_existing_position_blocks_add():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            entry_basis_pct=-5.0,
+            current_basis_pct=-11.1,
+            funding_events_captured=0,
+            next_funding_time=now + timedelta(hours=1),
+        )
+        store.write_positions({position.position_id: position})
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            basis_pct=-11.1,
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        fills = []
+        if store.fills_path.exists():
+            with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+                fills = list(csv.DictReader(f))
+        assert not fills
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        entry_decisions = [row for row in decisions if row["decision_type"] == "ENTRY"]
+        assert entry_decisions
+        assert entry_decisions[-1]["allowed"] == "False"
+        assert entry_decisions[-1]["reason"] == "volatility_cooldown"
+
+
+def test_volatility_cooldown_blocks_reentry_for_60_minutes():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        volatile_row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            basis_std_pct=6.0,
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        first_path = config.opportunities_dir / "kucoin_basis_opportunities_1.csv"
+        write_opportunities(first_path, [volatile_row])
+
+        run_paper_strategy_once(config, first_path)
+
+        assert store.load_active_cooldowns(datetime.now(timezone.utc))
+        calm_row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=datetime.now(timezone.utc) - timedelta(seconds=30),
+            basis_std_pct=0.1,
+            basis_trend_pct=0.1,
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        second_path = config.opportunities_dir / "kucoin_basis_opportunities_2.csv"
+        write_opportunities(second_path, [calm_row])
+
+        run_paper_strategy_once(config, second_path)
+
+        fills = []
+        if store.fills_path.exists():
+            with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+                fills = list(csv.DictReader(f))
+        assert not fills
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        entry_decisions = [row for row in decisions if row["decision_type"] == "ENTRY"]
+        assert entry_decisions[-1]["allowed"] == "False"
+        assert entry_decisions[-1]["reason"] == "volatility_cooldown"
+
+
 if __name__ == "__main__":
     test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage()
+    test_funding_accrues_without_current_opportunity_row()
+    test_add_position_fill_logs_added_chunk_not_running_total()
+    test_stale_close_row_is_not_used_for_exit_decision()
+    test_adverse_basis_holds_instead_of_hard_exit()
+    test_next_funding_above_hold_threshold_overrides_basis_take_profit()
+    test_adverse_basis_with_weak_funding_tries_profitable_unwind()
+    test_adverse_basis_existing_position_blocks_add()
+    test_volatility_cooldown_blocks_reentry_for_60_minutes()
     print("kucoin basis strategy tests passed")

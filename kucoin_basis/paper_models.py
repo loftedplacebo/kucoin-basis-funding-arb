@@ -31,6 +31,7 @@ class PaperPosition:
     updated_at: datetime
     next_funding_time: Optional[datetime]
     funding_events_captured: int
+    funding_interval_hours: Optional[float] = None
     status: str = "OPEN"
 
     def to_csv_row(self) -> dict:
@@ -64,6 +65,7 @@ class PaperPosition:
             created_at=parse_datetime(row.get("created_at")) or utc_now(),
             updated_at=parse_datetime(row.get("updated_at")) or utc_now(),
             next_funding_time=parse_datetime(row.get("next_funding_time")),
+            funding_interval_hours=parse_float(row.get("funding_interval_hours")),
             funding_events_captured=parse_int(row.get("funding_events_captured")),
             status=str(row.get("status", "OPEN")),
         )

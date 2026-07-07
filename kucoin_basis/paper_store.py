@@ -4,7 +4,7 @@ import csv
 from pathlib import Path
 
 from kucoin_basis.config import KucoinBasisConfig
-from kucoin_basis.models import format_datetime, utc_now
+from kucoin_basis.models import format_datetime, parse_datetime, utc_now
 from kucoin_basis.paper_models import PaperPosition
 
 
@@ -31,6 +31,7 @@ POSITION_FIELDS = [
     "updated_at",
     "next_funding_time",
     "funding_events_captured",
+    "funding_interval_hours",
     "status",
 ]
 
@@ -74,9 +75,22 @@ DECISION_FIELDS = [
     "notional_usd",
     "expected_edge_pct",
     "estimated_net_pnl_usd",
+    "row_timestamp_utc",
+    "row_age_seconds",
+    "entry_basis_pct",
+    "current_basis_pct",
+    "basis_improvement_pct",
 ]
 
 PROCESSED_FIELDS = ["opportunity_key", "timestamp_utc", "source_file", "processed_at_utc"]
+
+COOLDOWN_FIELDS = [
+    "timestamp_utc",
+    "base",
+    "direction",
+    "reason",
+    "expires_at_utc",
+]
 
 
 class PaperStore:
@@ -89,6 +103,7 @@ class PaperStore:
         self.funding_events_path = self.data_dir / "funding_events.csv"
         self.decisions_path = self.data_dir / "decisions.csv"
         self.processed_opportunities_path = self.data_dir / "processed_opportunities.csv"
+        self.cooldowns_path = self.data_dir / "cooldowns.csv"
 
     def load_all_positions(self) -> list[PaperPosition]:
         if not self.positions_path.exists():
@@ -123,6 +138,26 @@ class PaperStore:
 
     def append_decision(self, row: dict) -> None:
         self._append_row(self.decisions_path, DECISION_FIELDS, row)
+
+    def append_cooldown(self, row: dict) -> None:
+        self._append_row(self.cooldowns_path, COOLDOWN_FIELDS, row)
+
+    def load_active_cooldowns(self, now=None) -> dict[tuple[str, str], dict]:
+        now = now or utc_now()
+        if not self.cooldowns_path.exists():
+            return {}
+        active = {}
+        with self.cooldowns_path.open("r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                expires_at = parse_datetime(row.get("expires_at_utc"))
+                if expires_at is None or expires_at <= now:
+                    continue
+                key = (row.get("base", ""), row.get("direction", ""))
+                current = active.get(key)
+                current_expires = parse_datetime(current.get("expires_at_utc")) if current else None
+                if current is None or current_expires is None or expires_at > current_expires:
+                    active[key] = row
+        return active
 
     def load_processed_opportunities(self) -> set[str]:
         if not self.processed_opportunities_path.exists():

@@ -31,6 +31,20 @@ def load_opportunities(path: Path) -> list[OpportunityRow]:
         return [OpportunityRow.from_csv_row(row) for row in csv.DictReader(f)]
 
 
+def _fresh_opportunities(
+    rows: list[OpportunityRow],
+    config: KucoinBasisConfig,
+    now: datetime,
+) -> list[OpportunityRow]:
+    if not rows:
+        return []
+    latest_timestamp = max(row.timestamp_utc for row in rows)
+    age_seconds = (now - latest_timestamp).total_seconds()
+    if age_seconds > config.max_strategy_row_age_seconds:
+        return []
+    return [row for row in rows if row.timestamp_utc == latest_timestamp]
+
+
 def _position_id(base: str, direction: str) -> str:
     return f"KUCOIN_BASIS_{base}_{direction}"
 
@@ -140,6 +154,8 @@ def _estimate_exit_chunk(
 
 def _mark_position(position: PaperPosition, row: OpportunityRow, config: KucoinBasisConfig) -> PaperPosition:
     now = utc_now()
+    if row.funding_interval is not None:
+        position.funding_interval_hours = row.funding_interval
     if (
         position.next_funding_time is None
         and row.funding_time_utc is not None
@@ -161,9 +177,28 @@ def _mark_position(position: PaperPosition, row: OpportunityRow, config: KucoinB
     return position
 
 
+def _funding_interval_hours(
+    position: PaperPosition,
+    row: OpportunityRow | None,
+    config: KucoinBasisConfig,
+) -> float:
+    interval = (
+        (row.funding_interval if row is not None else None)
+        or position.funding_interval_hours
+        or config.fallback_funding_interval_hours
+    )
+    return interval if interval > 0 else config.fallback_funding_interval_hours
+
+
+def _raw_funding_rate_pct(position: PaperPosition, row: OpportunityRow | None) -> float:
+    if row is not None and row.funding_rate_pct is not None:
+        return row.funding_rate_pct
+    return position.funding_rate_pct_at_entry
+
+
 def _accrue_funding_if_crossed(
     position: PaperPosition,
-    row: OpportunityRow,
+    row: OpportunityRow | None,
     store: PaperStore,
     config: KucoinBasisConfig,
 ) -> None:
@@ -171,50 +206,100 @@ def _accrue_funding_if_crossed(
     funding_time = position.next_funding_time
     if funding_time is None or funding_time > now:
         return
-    raw_funding_rate_pct = row.funding_rate_pct if row.funding_rate_pct is not None else position.funding_rate_pct_at_entry
-    funding_benefit_pct = (
-        raw_funding_rate_pct
-        if position.direction == "LONG_SPOT_SHORT_PERP"
-        else -raw_funding_rate_pct
-    )
-    funding_pnl = position.notional_usd * funding_benefit_pct / 100
-    position.realised_funding_pnl_usd += funding_pnl
-    position.funding_events_captured += 1
-    position.next_funding_time = _next_funding_time_after(funding_time, row, config, now)
-    store.append_funding_event(
-        {
-            "timestamp_utc": format_datetime(now),
-            "position_id": position.position_id,
-            "base": position.base,
-            "direction": position.direction,
-            "perp_symbol": position.perp_symbol,
-            "funding_time_utc": format_datetime(funding_time),
-            "funding_rate_pct": f"{raw_funding_rate_pct:.8f}",
-            "notional_usd": f"{position.notional_usd:.8f}",
-            "funding_pnl_usd": f"{funding_pnl:.8f}",
-        }
-    )
+    if row is not None and row.funding_interval is not None:
+        position.funding_interval_hours = row.funding_interval
+    raw_funding_rate_pct = _raw_funding_rate_pct(position, row)
+    while funding_time is not None and funding_time <= now:
+        funding_benefit_pct = (
+            raw_funding_rate_pct
+            if position.direction == "LONG_SPOT_SHORT_PERP"
+            else -raw_funding_rate_pct
+        )
+        funding_pnl = position.notional_usd * funding_benefit_pct / 100
+        position.realised_funding_pnl_usd += funding_pnl
+        position.funding_events_captured += 1
+        store.append_funding_event(
+            {
+                "timestamp_utc": format_datetime(now),
+                "position_id": position.position_id,
+                "base": position.base,
+                "direction": position.direction,
+                "perp_symbol": position.perp_symbol,
+                "funding_time_utc": format_datetime(funding_time),
+                "funding_rate_pct": f"{raw_funding_rate_pct:.8f}",
+                "notional_usd": f"{position.notional_usd:.8f}",
+                "funding_pnl_usd": f"{funding_pnl:.8f}",
+            }
+        )
+        funding_time = _next_funding_time_after(funding_time, position, row, config)
+    position.next_funding_time = funding_time
+    position.updated_at = now
 
 
 def _next_funding_time_after(
     funding_time: datetime,
-    row: OpportunityRow,
+    position: PaperPosition,
+    row: OpportunityRow | None,
     config: KucoinBasisConfig,
-    now,
 ):
-    if row.funding_time_utc is not None and row.funding_time_utc > funding_time:
-        return row.funding_time_utc
-    interval_hours = row.funding_interval or config.fallback_funding_interval_hours
-    next_time = funding_time
-    while next_time <= now:
-        next_time += timedelta(hours=interval_hours)
-    return next_time
+    interval_hours = _funding_interval_hours(position, row, config)
+    return funding_time + timedelta(hours=interval_hours)
 
 
 def _basis_improvement_pct(position: PaperPosition) -> float:
     if position.direction == "SHORT_SPOT_LONG_PERP":
         return position.current_basis_pct - position.entry_basis_pct
     return position.entry_basis_pct - position.current_basis_pct
+
+
+def _basis_moved_adversely(position: PaperPosition, config: KucoinBasisConfig) -> bool:
+    return _basis_improvement_pct(position) < -config.max_basis_adverse_move_pct
+
+
+def _row_basis_too_volatile(row: OpportunityRow, config: KucoinBasisConfig) -> bool:
+    return (
+        (
+            row.basis_std_pct is not None
+            and row.basis_std_pct > config.max_basis_adverse_move_pct
+        )
+        or (
+            row.basis_trend_pct is not None
+            and abs(row.basis_trend_pct) > config.max_basis_adverse_move_pct
+        )
+    )
+
+
+def _cooldown_key(base: str, direction: str) -> tuple[str, str]:
+    return (base, direction)
+
+
+def _ensure_cooldown(
+    store: PaperStore,
+    active_cooldowns: dict[tuple[str, str], dict],
+    *,
+    base: str,
+    direction: str,
+    reason: str,
+    config: KucoinBasisConfig,
+) -> None:
+    key = _cooldown_key(base, direction)
+    if key in active_cooldowns:
+        return
+    now = utc_now()
+    expires_at = now + timedelta(minutes=config.volatility_cooldown_minutes)
+    row = {
+        "timestamp_utc": format_datetime(now),
+        "base": base,
+        "direction": direction,
+        "reason": reason,
+        "expires_at_utc": format_datetime(expires_at),
+    }
+    store.append_cooldown(row)
+    active_cooldowns[key] = row
+
+
+def _row_age_seconds(row: OpportunityRow, now: datetime) -> float:
+    return (now - row.timestamp_utc).total_seconds()
 
 
 def _should_exit(position: PaperPosition, row: OpportunityRow, config: KucoinBasisConfig) -> tuple[bool, str]:
@@ -226,14 +311,22 @@ def _should_exit(position: PaperPosition, row: OpportunityRow, config: KucoinBas
             if position.direction == "LONG_SPOT_SHORT_PERP"
             else -row.funding_rate_pct
         )
-    next_funding_weak = funding_benefit_pct is not None and funding_benefit_pct < config.min_funding_rate_pct
+    next_funding_weak = funding_benefit_pct is not None and funding_benefit_pct < config.min_hold_funding_rate_pct
     basis_improvement = _basis_improvement_pct(position)
-    if basis_improvement < -config.max_basis_adverse_move_pct:
-        return True, "basis_moved_adversely"
-    if utc_now() - position.created_at >= timedelta(hours=config.max_hold_hours):
-        return True, "max_hold_time_reached"
     if not funding_captured:
+        if basis_improvement < -config.max_basis_adverse_move_pct:
+            return False, "hold_basis_moved_adversely"
         return False, "hold_until_first_funding"
+
+    if (
+        funding_benefit_pct is not None
+        and funding_benefit_pct >= config.min_hold_funding_rate_pct
+    ):
+        return False, "hold_for_next_profitable_funding"
+    if basis_improvement < -config.max_basis_adverse_move_pct and next_funding_weak:
+        return True, "funding_weak_basis_adverse_try_unwind"
+    if next_funding_weak:
+        return True, "funding_captured_next_funding_below_threshold"
 
     basis_converged = basis_improvement >= config.basis_take_profit_improvement_pct
     basis_near_flat = abs(position.current_basis_pct) <= config.basis_near_flat_exit_abs_pct
@@ -242,13 +335,6 @@ def _should_exit(position: PaperPosition, row: OpportunityRow, config: KucoinBas
     if basis_near_flat and position.estimated_net_pnl_usd >= 0:
         return True, "basis_near_flat_take_profit"
 
-    if next_funding_weak:
-        return True, "funding_captured_next_funding_below_threshold"
-    if (
-        funding_benefit_pct is not None
-        and funding_benefit_pct >= config.min_funding_rate_pct
-    ):
-        return False, "hold_for_next_profitable_funding"
     if row.expected_edge_pct is not None and row.expected_edge_pct < config.min_expected_edge_pct:
         return True, "funding_captured_holding_edge_weak"
     return False, "hold"
@@ -363,6 +449,7 @@ def _add_to_position(position: PaperPosition, row: OpportunityRow) -> PaperPosit
         + ((funding_benefit_pct or 0.0) * row.notional_usd)
     ) / new_notional
     position.next_funding_time = row.funding_time_utc or position.next_funding_time
+    position.funding_interval_hours = row.funding_interval or position.funding_interval_hours
     position.updated_at = utc_now()
     return position
 
@@ -372,10 +459,13 @@ def run_paper_strategy_once(
     opportunity_path: Path | None = None,
 ) -> dict:
     store = PaperStore(config)
+    now = utc_now()
     opportunity_path = opportunity_path or latest_opportunity_file(config)
-    opportunities = load_opportunities(opportunity_path)
+    loaded_opportunities = load_opportunities(opportunity_path)
+    opportunities = _fresh_opportunities(loaded_opportunities, config, now)
     processed = store.load_processed_opportunities()
     positions = store.load_open_positions()
+    active_cooldowns = store.load_active_cooldowns(now)
     _repair_missing_next_funding_times(positions, store, config)
     by_base = _open_notional_by_base(positions)
 
@@ -390,14 +480,44 @@ def run_paper_strategy_once(
             direction=position.direction,
             notional_usd=position.notional_usd,
         ) or latest_by_position.get((position.base, position.direction))
-        if row is None:
-            continue
         _accrue_funding_if_crossed(position, row, store, config)
+        if row is None:
+            store.append_decision(
+                {
+                    "timestamp_utc": format_datetime(utc_now()),
+                    "decision_type": "EXIT",
+                    "base": position.base,
+                    "direction": position.direction,
+                    "position_id": position.position_id,
+                    "opportunity_key": "",
+                    "allowed": "False",
+                    "reason": "no_fresh_market_row",
+                    "notional_usd": f"{position.notional_usd:.8f}",
+                    "expected_edge_pct": "",
+                    "estimated_net_pnl_usd": f"{position.estimated_net_pnl_usd:.8f}",
+                    "row_timestamp_utc": "",
+                    "row_age_seconds": "",
+                    "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
+                    "current_basis_pct": f"{position.current_basis_pct:.8f}",
+                    "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
+                }
+            )
+            continue
         _mark_position(position, row, config)
         should_exit, reason = _should_exit(position, row, config)
+        if reason == "hold_basis_moved_adversely":
+            _ensure_cooldown(
+                store,
+                active_cooldowns,
+                base=position.base,
+                direction=position.direction,
+                reason=reason,
+                config=config,
+            )
+        decision_now = utc_now()
         store.append_decision(
             {
-                "timestamp_utc": format_datetime(utc_now()),
+                "timestamp_utc": format_datetime(decision_now),
                 "decision_type": "EXIT",
                 "base": position.base,
                 "direction": position.direction,
@@ -408,6 +528,11 @@ def run_paper_strategy_once(
                 "notional_usd": f"{position.notional_usd:.8f}",
                 "expected_edge_pct": "" if row.expected_edge_pct is None else f"{row.expected_edge_pct:.8f}",
                 "estimated_net_pnl_usd": f"{position.estimated_net_pnl_usd:.8f}",
+                "row_timestamp_utc": format_datetime(row.timestamp_utc),
+                "row_age_seconds": f"{_row_age_seconds(row, decision_now):.3f}",
+                "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
+                "current_basis_pct": f"{position.current_basis_pct:.8f}",
+                "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
             }
         )
         if should_exit:
@@ -418,7 +543,6 @@ def run_paper_strategy_once(
                 and (
                     not config.gentle_unwind_enabled
                     or position.estimated_net_pnl_usd >= position.notional_usd * config.min_profit_to_full_exit_pct / 100
-                    or reason in {"basis_moved_adversely", "max_hold_time_reached"}
                 )
             )
             if full_exit:
@@ -431,7 +555,7 @@ def run_paper_strategy_once(
                     position=position,
                     position_notional_usd=position.notional_usd,
                     config=config,
-                    require_profitable=reason not in {"basis_moved_adversely", "max_hold_time_reached"},
+                    require_profitable=True,
                 )
                 if partial is not None:
                     exit_chunk, exit_row, exit_estimate = partial
@@ -439,6 +563,26 @@ def run_paper_strategy_once(
                     close_cost = exit_estimate.close_cost_usd
 
             if exit_chunk is None:
+                store.append_decision(
+                    {
+                        "timestamp_utc": format_datetime(utc_now()),
+                        "decision_type": "EXIT",
+                        "base": position.base,
+                        "direction": position.direction,
+                        "position_id": position.position_id,
+                        "opportunity_key": row.opportunity_key,
+                        "allowed": "False",
+                        "reason": "exit_wanted_no_profitable_chunk",
+                        "notional_usd": f"{position.notional_usd:.8f}",
+                        "expected_edge_pct": "" if row.expected_edge_pct is None else f"{row.expected_edge_pct:.8f}",
+                        "estimated_net_pnl_usd": f"{position.estimated_net_pnl_usd:.8f}",
+                        "row_timestamp_utc": format_datetime(row.timestamp_utc),
+                        "row_age_seconds": f"{_row_age_seconds(row, utc_now()):.3f}",
+                        "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
+                        "current_basis_pct": f"{position.current_basis_pct:.8f}",
+                        "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
+                    }
+                )
                 continue
 
             fraction = 1.0 if position.notional_usd <= 0 else min(1.0, exit_chunk / position.notional_usd)
@@ -484,7 +628,33 @@ def run_paper_strategy_once(
         position_id = _position_id(row.base, row.direction)
         existing_position = positions.get(position_id)
         new_symbol_notional = by_base.get(row.base, 0.0) + row.notional_usd
-        if existing_position is None and len(positions) >= config.max_open_positions:
+        cooldown = active_cooldowns.get(_cooldown_key(row.base, row.direction))
+        if allowed and cooldown is not None:
+            allowed = False
+            reason = "volatility_cooldown"
+        elif allowed and _row_basis_too_volatile(row, config):
+            allowed = False
+            reason = "basis_too_volatile_no_entry"
+            _ensure_cooldown(
+                store,
+                active_cooldowns,
+                base=row.base,
+                direction=row.direction,
+                reason=reason,
+                config=config,
+            )
+        elif allowed and existing_position is not None and _basis_moved_adversely(existing_position, config):
+            allowed = False
+            reason = "basis_too_volatile_no_add"
+            _ensure_cooldown(
+                store,
+                active_cooldowns,
+                base=row.base,
+                direction=row.direction,
+                reason=reason,
+                config=config,
+            )
+        elif existing_position is None and len(positions) >= config.max_open_positions:
             allowed = False
             reason = "max_open_positions"
         elif total_open + row.notional_usd > config.max_total_notional_usd:
@@ -507,6 +677,11 @@ def run_paper_strategy_once(
                 "notional_usd": f"{row.notional_usd:.8f}",
                 "expected_edge_pct": "" if row.expected_edge_pct is None else f"{row.expected_edge_pct:.8f}",
                 "estimated_net_pnl_usd": "",
+                "row_timestamp_utc": format_datetime(row.timestamp_utc),
+                "row_age_seconds": f"{_row_age_seconds(row, utc_now()):.3f}",
+                "entry_basis_pct": "",
+                "current_basis_pct": "" if row.basis_pct is None else f"{row.basis_pct:.8f}",
+                "basis_improvement_pct": "",
             }
         )
         if not allowed:
@@ -549,6 +724,7 @@ def run_paper_strategy_once(
                 updated_at=utc_now(),
                 next_funding_time=row.funding_time_utc,
                 funding_events_captured=0,
+                funding_interval_hours=row.funding_interval or config.fallback_funding_interval_hours,
             )
             event_type = "OPEN_POSITION"
         positions[position.position_id] = position
@@ -564,10 +740,10 @@ def run_paper_strategy_once(
                 "direction": position.direction,
                 "spot_symbol": position.spot_symbol,
                 "perp_symbol": position.perp_symbol,
-                "notional_usd": f"{position.notional_usd:.8f}",
-                "spot_price": f"{position.spot_entry_price:.8f}",
-                "perp_price": f"{position.perp_entry_price:.8f}",
-                "fees_usd": f"{position.notional_usd * (config.estimated_spot_taker_fee_pct + config.estimated_perp_taker_fee_pct) / 100:.8f}",
+                "notional_usd": f"{row.notional_usd:.8f}",
+                "spot_price": "" if row.spot_entry_avg_price is None else f"{row.spot_entry_avg_price:.8f}",
+                "perp_price": "" if row.perp_entry_avg_price is None else f"{row.perp_entry_avg_price:.8f}",
+                "fees_usd": f"{row.notional_usd * (config.estimated_spot_taker_fee_pct + config.estimated_perp_taker_fee_pct) / 100:.8f}",
                 "realised_pnl_usd": "0.00000000",
                 "reason": row.reason,
             }
@@ -576,7 +752,8 @@ def run_paper_strategy_once(
     store.write_positions(positions)
     return {
         "opportunity_file": str(opportunity_path),
-        "opportunities_seen": len(opportunities),
+        "opportunities_seen": len(loaded_opportunities),
+        "fresh_opportunities_seen": len(opportunities),
         "entries_opened": entries,
         "open_positions": len(positions),
     }
