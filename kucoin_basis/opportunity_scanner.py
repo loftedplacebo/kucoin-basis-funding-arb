@@ -10,6 +10,7 @@ from kucoin_basis.funding import fetch_funding_snapshot
 from kucoin_basis.kucoin_public_client import KucoinPublicClient
 from kucoin_basis.models import OpportunityRow, SymbolPair, utc_now
 from kucoin_basis.orderbook import estimate_basis_round_trip
+from kucoin_basis.paper_store import PaperStore
 from kucoin_basis.symbols import discover_symbol_pairs, standard_symbol_for_base
 
 
@@ -102,6 +103,7 @@ def _decision_for_row(
     round_trip_fillable: bool,
     basis_observation_count: int,
     basis_percentile: float | None,
+    exit_cost_pct: float | None,
 ) -> tuple[str, str]:
     if config.approved_bases and pair.base not in config.approved_bases:
         return "REJECT", "base_not_whitelisted"
@@ -117,6 +119,8 @@ def _decision_for_row(
         return "REJECT", "expected_edge_below_threshold"
     if not round_trip_fillable:
         return "REJECT", "round_trip_not_fillable"
+    if exit_cost_pct is not None and exit_cost_pct > config.max_entry_exit_cost_pct:
+        return "REJECT", "exit_cost_too_high"
     if basis_observation_count >= config.min_basis_observations_for_stats:
         if pair.base and basis_percentile is None:
             return "REJECT", "basis_stats_missing"
@@ -175,6 +179,16 @@ def _basis_convergence_scenario(
     return target, upside, scenario_edge
 
 
+def _open_position_watchlist(config: KucoinBasisConfig) -> dict[str, dict[str, set[float]]]:
+    watchlist: dict[str, dict[str, set[float]]] = {}
+    for position in PaperStore(config).load_open_positions().values():
+        by_direction = watchlist.setdefault(position.base, {})
+        notionals = by_direction.setdefault(position.direction, set())
+        notionals.add(position.notional_usd)
+        notionals.update(config.gentle_unwind_chunk_ladder_usd)
+    return watchlist
+
+
 def _shortlist_directions(
     *,
     config: KucoinBasisConfig,
@@ -200,6 +214,7 @@ def scan_pair(
     pair: SymbolPair,
     contracts_by_symbol: dict[str, dict],
     now: datetime,
+    watchlist: dict[str, dict[str, set[float]]] | None = None,
 ) -> list[OpportunityRow]:
     funding = fetch_funding_snapshot(client, pair, contracts_by_symbol)
     minutes = funding.minutes_to_funding(now)
@@ -208,7 +223,9 @@ def scan_pair(
         funding_rate_pct=funding.funding_rate_pct,
         minutes_to_funding=minutes,
     )
-    if not shortlisted_directions:
+    watched_by_direction = (watchlist or {}).get(pair.base, {})
+    directions = sorted(set(shortlisted_directions) | set(watched_by_direction))
+    if not directions:
         return []
 
     standard_symbol = standard_symbol_for_base(pair.base)
@@ -246,10 +263,18 @@ def scan_pair(
     )
 
     rows = []
-    for notional in config.chunk_ladder_usd:
-        if notional > config.max_chunk_notional_usd:
+    notionals = set(config.chunk_ladder_usd)
+    for direction_notionals in watched_by_direction.values():
+        notionals.update(direction_notionals)
+    for notional in sorted(notionals):
+        if notional <= 0:
             continue
-        for direction in shortlisted_directions:
+        for direction in directions:
+            is_entry_chunk = notional in config.chunk_ladder_usd and notional <= config.max_chunk_notional_usd
+            is_entry_direction = direction in shortlisted_directions
+            is_watch_row = direction in watched_by_direction and notional in watched_by_direction[direction]
+            if not is_entry_chunk and not is_watch_row:
+                continue
             estimate = estimate_basis_round_trip(
                 direction=direction,
                 spot_book=spot_book,
@@ -270,23 +295,32 @@ def scan_pair(
                     - config.estimated_exit_fee_pct
                     - config.safety_buffer_pct
                 )
+            exit_cost_pct = (
+                estimate.spot_exit.slippage_pct
+                + estimate.perp_exit.slippage_pct
+                + config.estimated_exit_fee_pct
+            )
             basis_target_pct, basis_convergence_upside_pct, scenario_edge_pct = _basis_convergence_scenario(
                 config=config,
                 direction=direction,
                 basis_pct=basis_pct,
                 expected_edge_pct=expected_edge_pct,
             )
-            decision, reason = _decision_for_row(
-                pair=pair,
-                config=config,
-                direction=direction,
-                funding_benefit_pct=funding_benefit_pct,
-                minutes_to_funding=minutes,
-                expected_edge_pct=expected_edge_pct,
-                round_trip_fillable=estimate.round_trip_fillable,
-                basis_observation_count=basis_stats.observation_count,
-                basis_percentile=basis_stats.percentile,
-            )
+            if is_entry_chunk and is_entry_direction:
+                decision, reason = _decision_for_row(
+                    pair=pair,
+                    config=config,
+                    direction=direction,
+                    funding_benefit_pct=funding_benefit_pct,
+                    minutes_to_funding=minutes,
+                    expected_edge_pct=expected_edge_pct,
+                    round_trip_fillable=estimate.round_trip_fillable,
+                    basis_observation_count=basis_stats.observation_count,
+                    basis_percentile=basis_stats.percentile,
+                    exit_cost_pct=exit_cost_pct,
+                )
+            else:
+                decision, reason = "REJECT", "open_position_watchlist"
             rows.append(
                 OpportunityRow(
                     timestamp_utc=now,
@@ -347,12 +381,13 @@ def scan_once(
     now = datetime.now(timezone.utc)
     contracts = _contracts_by_symbol(client)
     pairs = discover_symbol_pairs(client, config)
+    watchlist = _open_position_watchlist(config)
     rows: list[OpportunityRow] = []
     errors: list[str] = []
 
     for pair in pairs:
         try:
-            rows.extend(scan_pair(client, config, pair, contracts, now))
+            rows.extend(scan_pair(client, config, pair, contracts, now, watchlist))
         except Exception as exc:
             errors.append(f"{pair.base}: {exc}")
 

@@ -3,8 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from datetime import datetime, timedelta, timezone
 
+from core.models import OrderBook, OrderBookLevel
 from kucoin_basis.config import KucoinBasisConfig
-from kucoin_basis.models import OpportunityRow, parse_float
+from kucoin_basis.models import OpportunityRow, SymbolPair, parse_float
+from kucoin_basis.opportunity_scanner import scan_pair
 from kucoin_basis.paper_models import PaperPosition
 from kucoin_basis.paper_store import PaperStore
 from kucoin_basis.paper_strategy import _accrue_funding_if_crossed, _choose_partial_close, _should_exit, run_paper_strategy_once
@@ -95,6 +97,32 @@ def write_opportunities(path: Path, rows: list[OpportunityRow]) -> None:
 
 def replace_row(row: OpportunityRow, **overrides) -> OpportunityRow:
     return OpportunityRow(**{**row.__dict__, **overrides})
+
+
+class DummyKucoinClient:
+    def get_spot_orderbook(self, standard_symbol: str, exchange_symbol: str, limit: int = 100) -> OrderBook:
+        now = datetime.now(timezone.utc)
+        return OrderBook(
+            exchange="kucoin",
+            market_type="spot",
+            standard_symbol=standard_symbol,
+            exchange_symbol=exchange_symbol,
+            bids=[OrderBookLevel(99.9, 1000.0)],
+            asks=[OrderBookLevel(100.0, 1000.0)],
+            observed_at_utc=now,
+        )
+
+    def get_futures_orderbook(self, standard_symbol: str, exchange_symbol: str, limit: int = 100) -> OrderBook:
+        now = datetime.now(timezone.utc)
+        return OrderBook(
+            exchange="kucoin",
+            market_type="futures",
+            standard_symbol=standard_symbol,
+            exchange_symbol=exchange_symbol,
+            bids=[OrderBookLevel(100.1, 1000.0)],
+            asks=[OrderBookLevel(100.2, 1000.0)],
+            observed_at_utc=now,
+        )
 
 
 def test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage():
@@ -233,11 +261,27 @@ def test_adverse_basis_holds_instead_of_hard_exit():
     assert reason == "hold_basis_moved_adversely"
 
 
-def test_next_funding_above_hold_threshold_overrides_basis_take_profit():
-    config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30)
+def test_very_juicy_next_funding_overrides_basis_take_profit():
+    config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30, juicy_hold_funding_rate_pct=1.0)
     position = make_position(
         entry_basis_pct=-5.0,
         current_basis_pct=-4.0,
+        funding_events_captured=1,
+        estimated_net_pnl_usd=10.0,
+    )
+    row = replace_row(make_row(500.0, 0.01, 0.01), funding_rate_pct=-1.5)
+
+    should_exit, reason = _should_exit(position, row, config)
+
+    assert should_exit is False
+    assert reason == "hold_for_juicy_next_funding"
+
+
+def test_profitable_next_funding_still_tries_gentle_unwind_after_funding():
+    config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30, juicy_hold_funding_rate_pct=1.0)
+    position = make_position(
+        entry_basis_pct=-5.0,
+        current_basis_pct=-4.8,
         funding_events_captured=1,
         estimated_net_pnl_usd=10.0,
     )
@@ -245,8 +289,74 @@ def test_next_funding_above_hold_threshold_overrides_basis_take_profit():
 
     should_exit, reason = _should_exit(position, row, config)
 
-    assert should_exit is False
-    assert reason == "hold_for_next_profitable_funding"
+    assert should_exit is True
+    assert reason == "funding_captured_try_profitable_unwind"
+
+
+def test_profitable_post_funding_unwind_closes_best_chunk_only():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=500.0,
+            realised_funding_pnl_usd=5.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        small = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        large = replace_row(
+            make_row(500.0, 0.05, 0.05),
+            timestamp_utc=now - timedelta(seconds=30),
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [large, small])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        positions = store.load_open_positions()
+        assert positions[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        assert fills[-1]["event_type"] == "PARTIAL_CLOSE"
+        assert parse_float(fills[-1]["notional_usd"]) == 100.0
+        assert fills[-1]["reason"] == "funding_captured_try_profitable_unwind"
+
+
+def test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        pair = SymbolPair(base="MIRA", spot_symbol="MIRA-USDT", perp_symbol="MIRAUSDTM")
+        now = datetime.now(timezone.utc)
+        contracts = {
+            "MIRAUSDTM": {
+                "symbol": "MIRAUSDTM",
+                "fundingFeeRate": "0.001",
+                "predictedFundingFeeRate": "0.001",
+                "nextFundingRateDateTime": int((now + timedelta(hours=1)).timestamp() * 1000),
+                "currentFundingRateGranularity": 3600000,
+            }
+        }
+
+        rows = scan_pair(
+            DummyKucoinClient(),
+            config,
+            pair,
+            contracts,
+            now,
+            {"MIRA": {"SHORT_SPOT_LONG_PERP": {100.0, 500.0}}},
+        )
+
+        watch_rows = [row for row in rows if row.direction == "SHORT_SPOT_LONG_PERP"]
+        assert {row.notional_usd for row in watch_rows} >= {100.0, 500.0}
+        assert all(row.reason == "open_position_watchlist" for row in watch_rows)
 
 
 def test_adverse_basis_with_weak_funding_tries_profitable_unwind():
@@ -350,7 +460,10 @@ if __name__ == "__main__":
     test_add_position_fill_logs_added_chunk_not_running_total()
     test_stale_close_row_is_not_used_for_exit_decision()
     test_adverse_basis_holds_instead_of_hard_exit()
-    test_next_funding_above_hold_threshold_overrides_basis_take_profit()
+    test_very_juicy_next_funding_overrides_basis_take_profit()
+    test_profitable_next_funding_still_tries_gentle_unwind_after_funding()
+    test_profitable_post_funding_unwind_closes_best_chunk_only()
+    test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist()
     test_adverse_basis_with_weak_funding_tries_profitable_unwind()
     test_adverse_basis_existing_position_blocks_add()
     test_volatility_cooldown_blocks_reentry_for_60_minutes()

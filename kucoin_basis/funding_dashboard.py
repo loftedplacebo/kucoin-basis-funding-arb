@@ -709,6 +709,10 @@ HTML = """<!doctype html>
         ["Open positions", summaryPayload.openPositions],
         ["Open notional", fmtMoney(summaryPayload.totalOpenNotionalUsd)],
         ["Estimated open PnL", fmtMoney(summaryPayload.estimatedOpenPnlUsd)],
+        ["Total PnL incl open", fmtMoney(summaryPayload.totalPnlInclOpenUsd)],
+        ["Total realised PnL", fmtMoney(summaryPayload.totalRealisedPnlUsd)],
+        ["Total funding PnL", fmtMoney(summaryPayload.totalRealisedFundingPnlUsd)],
+        ["Total trade PnL", fmtMoney(summaryPayload.totalRealisedTradePnlUsd)],
         ["Funding PnL today", fmtMoney(summaryPayload.realisedFundingPnlTodayUsd)],
         ["Total PnL today", fmtMoney(summaryPayload.realisedTotalPnlTodayUsd)],
         ["Funding events today", summaryPayload.fundingEventsCapturedToday],
@@ -1272,11 +1276,21 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         for row in funding_events
         if _is_today(row, "timestamp_utc", now)
     )
+    realised_funding_total = sum(
+        parse_float(row.get("funding_pnl_usd"), 0.0) or 0.0
+        for row in funding_events
+    )
     realised_trade_today = sum(
         parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
         for row in fills
         if _is_today(row, "timestamp_utc", now)
     )
+    realised_trade_total = sum(
+        parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+        for row in fills
+    )
+    estimated_open_pnl = sum(position.estimated_net_pnl_usd for position in open_positions)
+    realised_total = realised_funding_total + realised_trade_total
     entry_rejections = Counter(
         row.get("reason", "")
         for row in decisions
@@ -1292,7 +1306,11 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         "sourceFile": str(latest_path) if latest_path else "",
         "openPositions": len(open_positions),
         "totalOpenNotionalUsd": sum(position.notional_usd for position in open_positions),
-        "estimatedOpenPnlUsd": sum(position.estimated_net_pnl_usd for position in open_positions),
+        "estimatedOpenPnlUsd": estimated_open_pnl,
+        "totalRealisedFundingPnlUsd": realised_funding_total,
+        "totalRealisedTradePnlUsd": realised_trade_total,
+        "totalRealisedPnlUsd": realised_total,
+        "totalPnlInclOpenUsd": realised_total + estimated_open_pnl,
         "realisedFundingPnlTodayUsd": realised_funding_today,
         "realisedTradePnlTodayUsd": realised_trade_today,
         "realisedTotalPnlTodayUsd": realised_funding_today + realised_trade_today,

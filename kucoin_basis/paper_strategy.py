@@ -320,13 +320,18 @@ def _should_exit(position: PaperPosition, row: OpportunityRow, config: KucoinBas
 
     if (
         funding_benefit_pct is not None
-        and funding_benefit_pct >= config.min_hold_funding_rate_pct
+        and funding_benefit_pct >= config.juicy_hold_funding_rate_pct
     ):
-        return False, "hold_for_next_profitable_funding"
+        return False, "hold_for_juicy_next_funding"
     if basis_improvement < -config.max_basis_adverse_move_pct and next_funding_weak:
         return True, "funding_weak_basis_adverse_try_unwind"
     if next_funding_weak:
         return True, "funding_captured_next_funding_below_threshold"
+    if (
+        funding_benefit_pct is not None
+        and funding_benefit_pct >= config.min_hold_funding_rate_pct
+    ):
+        return True, "funding_captured_try_profitable_unwind"
 
     basis_converged = basis_improvement >= config.basis_take_profit_improvement_pct
     basis_near_flat = abs(position.current_basis_pct) <= config.basis_near_flat_exit_abs_pct
@@ -353,7 +358,6 @@ def _choose_full_close_row(
         if row.base == base
         and row.direction == direction
         and row.notional_usd + 1e-8 >= notional_usd
-        and row.round_trip_fillable
         and row.spot_exit_avg_price is not None
         and row.perp_exit_avg_price is not None
     ]
@@ -538,8 +542,12 @@ def run_paper_strategy_once(
         if should_exit:
             exit_chunk = None
             exit_row = row
+            force_gentle_unwind = reason == "funding_captured_try_profitable_unwind"
             full_exit = (
-                row.round_trip_fillable
+                not force_gentle_unwind
+                and row.notional_usd + 1e-8 >= position.notional_usd
+                and row.spot_exit_avg_price is not None
+                and row.perp_exit_avg_price is not None
                 and (
                     not config.gentle_unwind_enabled
                     or position.estimated_net_pnl_usd >= position.notional_usd * config.min_profit_to_full_exit_pct / 100

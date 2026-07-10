@@ -31,6 +31,7 @@ class KucoinBasisConfig:
     estimated_perp_taker_fee_pct: float = 0.06
     estimated_exit_fee_pct: float = 0.16
     safety_buffer_pct: float = 0.03
+    max_entry_exit_cost_pct: float = 1.00
 
     max_orderbook_age_ms: int = 1_000
     max_basis_adverse_move_pct: float = 5.00
@@ -46,6 +47,7 @@ class KucoinBasisConfig:
     gentle_unwind_enabled: bool = True
     gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
     min_profit_to_full_exit_pct: float = 0.02
+    juicy_hold_funding_rate_pct: float = 1.00
     fallback_funding_interval_hours: float = 8.0
 
     data_dir: Path = REPO_ROOT / "data" / "kucoin_basis"
