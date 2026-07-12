@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=kucoin
+User=root
 WorkingDirectory=/opt/kucoin-basis-funding-arb
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/kucoin-basis-funding-arb/.venv/bin/python kucoin_basis_convergence/run_paper_strategy.py --loop --interval 60
@@ -14,4 +14,3 @@ RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
-
