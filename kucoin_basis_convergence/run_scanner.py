@@ -104,9 +104,9 @@ def main() -> None:
                 raise
         if not args.loop:
             return
-        time.sleep(args.interval)
+        elapsed = time.monotonic() - started
+        time.sleep(max(0.0, args.interval - elapsed))
 
 
 if __name__ == "__main__":
     main()
-
