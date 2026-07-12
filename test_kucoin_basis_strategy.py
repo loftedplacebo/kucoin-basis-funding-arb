@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from core.models import OrderBook, OrderBookLevel
 from kucoin_basis.config import KucoinBasisConfig
 from kucoin_basis.models import OpportunityRow, SymbolPair, parse_float
+from kucoin_basis.funding_dashboard import load_summary_payload
 from kucoin_basis.opportunity_scanner import scan_pair
 from kucoin_basis.paper_models import PaperPosition
 from kucoin_basis.paper_store import PaperStore
@@ -328,6 +329,125 @@ def test_profitable_post_funding_unwind_closes_best_chunk_only():
         assert fills[-1]["event_type"] == "PARTIAL_CLOSE"
         assert parse_float(fills[-1]["notional_usd"]) == 100.0
         assert fills[-1]["reason"] == "funding_captured_try_profitable_unwind"
+        assert parse_float(fills[-1]["realised_basis_pnl_usd"]) > 0
+        assert parse_float(fills[-1]["realised_funding_pnl_usd"]) == 1.0
+        assert 0 < parse_float(fills[-1]["realised_pnl_usd"]) < parse_float(fills[-1]["realised_funding_pnl_usd"])
+        assert positions[position.position_id].realised_funding_pnl_usd == 4.0
+
+
+def test_post_close_cooldown_blocks_same_loop_reentry():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=500.0,
+            realised_funding_pnl_usd=5.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        entry_decisions = [item for item in decisions if item["decision_type"] == "ENTRY"]
+        assert entry_decisions
+        assert entry_decisions[-1]["allowed"] == "False"
+        assert entry_decisions[-1]["reason"] == "post_close_reentry_cooldown"
+
+
+def test_profitable_carry_unwind_requires_profit_excluding_funding():
+    config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30, juicy_hold_funding_rate_pct=1.0)
+    position = make_position(
+        notional_usd=500.0,
+        realised_funding_pnl_usd=50.0,
+        funding_events_captured=1,
+        spot_qty=5.0,
+        perp_qty=5.0,
+    )
+    lossy_row = replace_row(
+        make_row(100.0, 0.01, 0.01),
+        spot_exit_avg_price=100.1,
+        perp_exit_avg_price=99.9,
+        spot_ask=100.1,
+        perp_bid=99.9,
+        expected_edge_pct=0.5,
+    )
+
+    selected = _choose_partial_close(
+        [lossy_row],
+        base="MIRA",
+        direction="SHORT_SPOT_LONG_PERP",
+        position=position,
+        position_notional_usd=position.notional_usd,
+        config=config,
+        require_ex_funding_profit=True,
+    )
+
+    assert selected is None
+
+
+def test_summary_totals_do_not_double_count_open_funding():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            notional_usd=100.0,
+            realised_funding_pnl_usd=5.0,
+            unrealised_basis_pnl_usd=-3.0,
+            estimated_close_cost_usd=1.0,
+            estimated_net_pnl_usd=1.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        store.append_funding_event(
+            {
+                "timestamp_utc": now.isoformat(),
+                "position_id": position.position_id,
+                "base": position.base,
+                "direction": position.direction,
+                "perp_symbol": position.perp_symbol,
+                "funding_time_utc": now.isoformat(),
+                "funding_rate_pct": "-5.00000000",
+                "notional_usd": "100.00000000",
+                "funding_pnl_usd": "5.00000000",
+            }
+        )
+        store.append_fill(
+            {
+                "timestamp_utc": now.isoformat(),
+                "event_type": "PARTIAL_CLOSE",
+                "position_id": position.position_id,
+                "base": position.base,
+                "direction": position.direction,
+                "spot_symbol": position.spot_symbol,
+                "perp_symbol": position.perp_symbol,
+                "notional_usd": "100.00000000",
+                "spot_price": "1",
+                "perp_price": "1",
+                "fees_usd": "1.00000000",
+                "realised_pnl_usd": "-2.00000000",
+                "realised_basis_pnl_usd": "-1.00000000",
+                "realised_funding_pnl_usd": "5.00000000",
+                "reason": "test",
+            }
+        )
+
+        payload = load_summary_payload(config)
+
+        assert payload["estimatedOpenPnlExFundingUsd"] == -4.0
+        assert payload["totalRealisedPnlUsd"] == 3.0
+        assert payload["totalPnlInclOpenUsd"] == -1.0
 
 
 def test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist():
@@ -408,7 +528,7 @@ def test_adverse_basis_existing_position_blocks_add():
         entry_decisions = [row for row in decisions if row["decision_type"] == "ENTRY"]
         assert entry_decisions
         assert entry_decisions[-1]["allowed"] == "False"
-        assert entry_decisions[-1]["reason"] == "volatility_cooldown"
+        assert entry_decisions[-1]["reason"] == "hold_basis_moved_adversely"
 
 
 def test_volatility_cooldown_blocks_reentry_for_60_minutes():
@@ -451,7 +571,7 @@ def test_volatility_cooldown_blocks_reentry_for_60_minutes():
             decisions = list(csv.DictReader(f))
         entry_decisions = [row for row in decisions if row["decision_type"] == "ENTRY"]
         assert entry_decisions[-1]["allowed"] == "False"
-        assert entry_decisions[-1]["reason"] == "volatility_cooldown"
+        assert entry_decisions[-1]["reason"] == "basis_too_volatile_no_entry"
 
 
 if __name__ == "__main__":
@@ -463,6 +583,9 @@ if __name__ == "__main__":
     test_very_juicy_next_funding_overrides_basis_take_profit()
     test_profitable_next_funding_still_tries_gentle_unwind_after_funding()
     test_profitable_post_funding_unwind_closes_best_chunk_only()
+    test_post_close_cooldown_blocks_same_loop_reentry()
+    test_profitable_carry_unwind_requires_profit_excluding_funding()
+    test_summary_totals_do_not_double_count_open_funding()
     test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist()
     test_adverse_basis_with_weak_funding_tries_profitable_unwind()
     test_adverse_basis_existing_position_blocks_add()

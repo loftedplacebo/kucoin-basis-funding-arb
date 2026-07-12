@@ -48,6 +48,8 @@ FILL_FIELDS = [
     "perp_price",
     "fees_usd",
     "realised_pnl_usd",
+    "realised_basis_pnl_usd",
+    "realised_funding_pnl_usd",
     "reason",
 ]
 

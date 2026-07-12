@@ -15,6 +15,8 @@ from kucoin_basis.paper_store import PaperStore
 class ExitEstimate:
     basis_pnl_usd: float
     close_cost_usd: float
+    funding_pnl_usd: float
+    net_pnl_ex_funding_usd: float
     net_pnl_usd: float
     net_pnl_pct: float
 
@@ -143,10 +145,13 @@ def _estimate_exit_chunk(
     basis_pnl = spot_pnl + perp_pnl
     close_cost = chunk_notional_usd * _exit_slippage_cost_pct(row, config) / 100
     funding_pnl = position.realised_funding_pnl_usd * fraction
-    net_pnl = funding_pnl + basis_pnl - close_cost
+    net_pnl_ex_funding = basis_pnl - close_cost
+    net_pnl = funding_pnl + net_pnl_ex_funding
     return ExitEstimate(
         basis_pnl_usd=basis_pnl,
         close_cost_usd=close_cost,
+        funding_pnl_usd=funding_pnl,
+        net_pnl_ex_funding_usd=net_pnl_ex_funding,
         net_pnl_usd=net_pnl,
         net_pnl_pct=(net_pnl / chunk_notional_usd) * 100,
     )
@@ -281,12 +286,13 @@ def _ensure_cooldown(
     direction: str,
     reason: str,
     config: KucoinBasisConfig,
+    duration_minutes: float | None = None,
 ) -> None:
     key = _cooldown_key(base, direction)
     if key in active_cooldowns:
         return
     now = utc_now()
-    expires_at = now + timedelta(minutes=config.volatility_cooldown_minutes)
+    expires_at = now + timedelta(minutes=duration_minutes or config.volatility_cooldown_minutes)
     row = {
         "timestamp_utc": format_datetime(now),
         "base": base,
@@ -375,6 +381,7 @@ def _choose_partial_close(
     position_notional_usd: float,
     config: KucoinBasisConfig,
     require_profitable: bool = True,
+    require_ex_funding_profit: bool = False,
 ) -> tuple[float, OpportunityRow, ExitEstimate] | None:
     candidates: list[tuple[float, OpportunityRow, ExitEstimate]] = []
     for chunk in config.gentle_unwind_chunk_ladder_usd:
@@ -391,7 +398,8 @@ def _choose_partial_close(
         estimate = _estimate_exit_chunk(position, row, config, chunk)
         if estimate is None:
             continue
-        if require_profitable and estimate.net_pnl_usd <= 0:
+        profit_to_test = estimate.net_pnl_ex_funding_usd if require_ex_funding_profit else estimate.net_pnl_usd
+        if require_profitable and profit_to_test <= 0:
             continue
         candidates.append((chunk, row, estimate))
     if not candidates:
@@ -399,8 +407,12 @@ def _choose_partial_close(
     return max(
         candidates,
         key=lambda candidate: (
-            candidate[2].net_pnl_pct,
-            candidate[2].net_pnl_usd,
+            (
+                candidate[2].net_pnl_ex_funding_usd / candidate[0] * 100
+                if require_ex_funding_profit
+                else candidate[2].net_pnl_pct
+            ),
+            candidate[2].net_pnl_ex_funding_usd if require_ex_funding_profit else candidate[2].net_pnl_usd,
             -candidate[0],
         ),
     )
@@ -411,6 +423,7 @@ def _reduce_position(position: PaperPosition, chunk_notional_usd: float) -> None
         position.notional_usd = 0.0
         position.spot_qty = 0.0
         position.perp_qty = 0.0
+        position.realised_funding_pnl_usd = 0.0
         position.status = "CLOSED"
         position.updated_at = utc_now()
         return
@@ -419,6 +432,7 @@ def _reduce_position(position: PaperPosition, chunk_notional_usd: float) -> None
     position.notional_usd -= chunk_notional_usd
     position.spot_qty *= 1 - fraction
     position.perp_qty *= 1 - fraction
+    position.realised_funding_pnl_usd *= 1 - fraction
     position.updated_at = utc_now()
 
 
@@ -542,6 +556,7 @@ def run_paper_strategy_once(
         if should_exit:
             exit_chunk = None
             exit_row = row
+            exit_estimate = None
             force_gentle_unwind = reason == "funding_captured_try_profitable_unwind"
             full_exit = (
                 not force_gentle_unwind
@@ -555,6 +570,7 @@ def run_paper_strategy_once(
             )
             if full_exit:
                 exit_chunk = position.notional_usd
+                exit_estimate = _estimate_exit_chunk(position, row, config, exit_chunk)
             elif config.gentle_unwind_enabled:
                 partial = _choose_partial_close(
                     opportunities,
@@ -564,13 +580,12 @@ def run_paper_strategy_once(
                     position_notional_usd=position.notional_usd,
                     config=config,
                     require_profitable=True,
+                    require_ex_funding_profit=force_gentle_unwind,
                 )
                 if partial is not None:
                     exit_chunk, exit_row, exit_estimate = partial
-                    realised_pnl = exit_estimate.net_pnl_usd
-                    close_cost = exit_estimate.close_cost_usd
 
-            if exit_chunk is None:
+            if exit_chunk is None or exit_estimate is None:
                 store.append_decision(
                     {
                         "timestamp_utc": format_datetime(utc_now()),
@@ -593,10 +608,6 @@ def run_paper_strategy_once(
                 )
                 continue
 
-            fraction = 1.0 if position.notional_usd <= 0 else min(1.0, exit_chunk / position.notional_usd)
-            if full_exit:
-                realised_pnl = position.estimated_net_pnl_usd * fraction
-                close_cost = position.estimated_close_cost_usd * fraction
             event_type = "CLOSE_POSITION" if exit_chunk >= position.notional_usd - 1e-8 else "PARTIAL_CLOSE"
             store.append_fill(
                 {
@@ -610,10 +621,21 @@ def run_paper_strategy_once(
                     "notional_usd": f"{exit_chunk:.8f}",
                     "spot_price": exit_row.spot_exit_avg_price or "",
                     "perp_price": exit_row.perp_exit_avg_price or "",
-                    "fees_usd": f"{close_cost:.8f}",
-                    "realised_pnl_usd": f"{realised_pnl:.8f}",
+                    "fees_usd": f"{exit_estimate.close_cost_usd:.8f}",
+                    "realised_pnl_usd": f"{exit_estimate.net_pnl_ex_funding_usd:.8f}",
+                    "realised_basis_pnl_usd": f"{exit_estimate.basis_pnl_usd:.8f}",
+                    "realised_funding_pnl_usd": f"{exit_estimate.funding_pnl_usd:.8f}",
                     "reason": reason,
                 }
+            )
+            _ensure_cooldown(
+                store,
+                active_cooldowns,
+                base=position.base,
+                direction=position.direction,
+                reason="post_close_reentry_cooldown",
+                config=config,
+                duration_minutes=config.post_close_reentry_cooldown_minutes,
             )
             _reduce_position(position, exit_chunk)
             if position.status == "CLOSED":
@@ -639,7 +661,7 @@ def run_paper_strategy_once(
         cooldown = active_cooldowns.get(_cooldown_key(row.base, row.direction))
         if allowed and cooldown is not None:
             allowed = False
-            reason = "volatility_cooldown"
+            reason = cooldown.get("reason") or "volatility_cooldown"
         elif allowed and _row_basis_too_volatile(row, config):
             allowed = False
             reason = "basis_too_volatile_no_entry"
@@ -753,6 +775,8 @@ def run_paper_strategy_once(
                 "perp_price": "" if row.perp_entry_avg_price is None else f"{row.perp_entry_avg_price:.8f}",
                 "fees_usd": f"{row.notional_usd * (config.estimated_spot_taker_fee_pct + config.estimated_perp_taker_fee_pct) / 100:.8f}",
                 "realised_pnl_usd": "0.00000000",
+                "realised_basis_pnl_usd": "",
+                "realised_funding_pnl_usd": "",
                 "reason": row.reason,
             }
         )

@@ -48,6 +48,7 @@ class KucoinBasisConfig:
     gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
     min_profit_to_full_exit_pct: float = 0.02
     juicy_hold_funding_rate_pct: float = 1.00
+    post_close_reentry_cooldown_minutes: float = 60.0
     fallback_funding_interval_hours: float = 8.0
 
     data_dir: Path = REPO_ROOT / "data" / "kucoin_basis"

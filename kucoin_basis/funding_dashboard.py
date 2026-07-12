@@ -708,11 +708,11 @@ HTML = """<!doctype html>
       const metrics = [
         ["Open positions", summaryPayload.openPositions],
         ["Open notional", fmtMoney(summaryPayload.totalOpenNotionalUsd)],
-        ["Estimated open PnL", fmtMoney(summaryPayload.estimatedOpenPnlUsd)],
+        ["Open basis/fees PnL", fmtMoney(summaryPayload.estimatedOpenPnlExFundingUsd)],
         ["Total PnL incl open", fmtMoney(summaryPayload.totalPnlInclOpenUsd)],
         ["Total realised PnL", fmtMoney(summaryPayload.totalRealisedPnlUsd)],
         ["Total funding PnL", fmtMoney(summaryPayload.totalRealisedFundingPnlUsd)],
-        ["Total trade PnL", fmtMoney(summaryPayload.totalRealisedTradePnlUsd)],
+        ["Total basis/fees PnL", fmtMoney(summaryPayload.totalRealisedTradePnlUsd)],
         ["Funding PnL today", fmtMoney(summaryPayload.realisedFundingPnlTodayUsd)],
         ["Total PnL today", fmtMoney(summaryPayload.realisedTotalPnlTodayUsd)],
         ["Funding events today", summaryPayload.fundingEventsCapturedToday],
@@ -980,6 +980,63 @@ def _load_csv(path: Path) -> list[dict]:
 def _is_today(row: dict, field: str, now: datetime) -> bool:
     timestamp = parse_datetime(row.get(field))
     return timestamp is not None and timestamp.date() == now.astimezone(timezone.utc).date()
+
+
+def _fill_realised_trade_pnl(row: dict) -> float:
+    return parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
+
+
+def _corrected_trade_pnl_rows(fills: list[dict], funding_events: list[dict]) -> list[dict]:
+    events = []
+    for row in fills:
+        timestamp = parse_datetime(row.get("timestamp_utc"))
+        if timestamp is not None:
+            events.append((timestamp, 1, "fill", row))
+    for row in funding_events:
+        timestamp = parse_datetime(row.get("timestamp_utc"))
+        if timestamp is not None:
+            events.append((timestamp, 0, "funding", row))
+    events.sort(key=lambda item: (item[0], item[1]))
+
+    state: dict[str, dict[str, float]] = {}
+    corrected = []
+    for timestamp, _, event_type, row in events:
+        position_id = row.get("position_id", "")
+        position_state = state.setdefault(position_id, {"notional": 0.0, "funding_pool": 0.0})
+        if event_type == "funding":
+            position_state["funding_pool"] += parse_float(row.get("funding_pnl_usd"), 0.0) or 0.0
+            continue
+
+        fill_type = row.get("event_type", "")
+        notional = parse_float(row.get("notional_usd"), 0.0) or 0.0
+        if fill_type in {"OPEN_POSITION", "ADD_POSITION"}:
+            position_state["notional"] += notional
+            continue
+        if fill_type not in {"PARTIAL_CLOSE", "CLOSE_POSITION"}:
+            continue
+
+        realised_pnl = _fill_realised_trade_pnl(row)
+        explicit_funding = row.get("realised_funding_pnl_usd")
+        if explicit_funding not in (None, ""):
+            allocated_funding = parse_float(explicit_funding, 0.0) or 0.0
+            trade_pnl = realised_pnl
+        else:
+            current_notional = position_state["notional"]
+            fraction = min(1.0, notional / current_notional) if current_notional > 0 else 0.0
+            allocated_funding = position_state["funding_pool"] * fraction
+            trade_pnl = realised_pnl - allocated_funding
+
+        position_state["funding_pool"] -= allocated_funding
+        position_state["notional"] = max(0.0, position_state["notional"] - notional)
+        corrected.append({
+            "timestamp_utc": timestamp,
+            "trade_pnl_usd": trade_pnl,
+        })
+    return corrected
+
+
+def _open_pnl_ex_funding(position) -> float:
+    return position.unrealised_basis_pnl_usd - position.estimated_close_cost_usd
 
 
 def _latest_opportunity_file(config: KucoinBasisConfig) -> Path | None:
@@ -1270,6 +1327,7 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     decisions = _load_csv(store.decisions_path)
     active_cooldowns = store.load_active_cooldowns(now)
     latest_path, latest_rows = _latest_opportunity_rows(config)
+    corrected_trade_pnl_rows = _corrected_trade_pnl_rows(fills, funding_events)
 
     realised_funding_today = sum(
         parse_float(row.get("funding_pnl_usd"), 0.0) or 0.0
@@ -1281,15 +1339,15 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         for row in funding_events
     )
     realised_trade_today = sum(
-        parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
-        for row in fills
-        if _is_today(row, "timestamp_utc", now)
+        row["trade_pnl_usd"]
+        for row in corrected_trade_pnl_rows
+        if row["timestamp_utc"].date() == now.astimezone(timezone.utc).date()
     )
     realised_trade_total = sum(
-        parse_float(row.get("realised_pnl_usd"), 0.0) or 0.0
-        for row in fills
+        row["trade_pnl_usd"]
+        for row in corrected_trade_pnl_rows
     )
-    estimated_open_pnl = sum(position.estimated_net_pnl_usd for position in open_positions)
+    estimated_open_pnl = sum(_open_pnl_ex_funding(position) for position in open_positions)
     realised_total = realised_funding_total + realised_trade_total
     entry_rejections = Counter(
         row.get("reason", "")
@@ -1307,6 +1365,7 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         "openPositions": len(open_positions),
         "totalOpenNotionalUsd": sum(position.notional_usd for position in open_positions),
         "estimatedOpenPnlUsd": estimated_open_pnl,
+        "estimatedOpenPnlExFundingUsd": estimated_open_pnl,
         "totalRealisedFundingPnlUsd": realised_funding_total,
         "totalRealisedTradePnlUsd": realised_trade_total,
         "totalRealisedPnlUsd": realised_total,
