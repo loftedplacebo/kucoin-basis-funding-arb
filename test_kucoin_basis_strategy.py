@@ -396,6 +396,45 @@ def test_profitable_carry_unwind_requires_profit_excluding_funding():
     assert selected is None
 
 
+def test_weak_funding_exit_does_not_spend_funding_on_bad_basis_close():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=500.0,
+            realised_funding_pnl_usd=50.0,
+            funding_events_captured=1,
+            spot_qty=5.0,
+            perp_qty=5.0,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        lossy_full_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.1,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [lossy_full_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        positions = store.load_open_positions()
+        assert positions[position.position_id].notional_usd == 500.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decisions = [row for row in decisions if row["decision_type"] == "EXIT"]
+        assert exit_decisions[-1]["allowed"] == "False"
+        assert exit_decisions[-1]["reason"] == "exit_wanted_no_profitable_chunk"
+
+
 def test_summary_totals_do_not_double_count_open_funding():
     with TemporaryDirectory() as tmp:
         config = make_config(Path(tmp))
@@ -585,6 +624,7 @@ if __name__ == "__main__":
     test_profitable_post_funding_unwind_closes_best_chunk_only()
     test_post_close_cooldown_blocks_same_loop_reentry()
     test_profitable_carry_unwind_requires_profit_excluding_funding()
+    test_weak_funding_exit_does_not_spend_funding_on_bad_basis_close()
     test_summary_totals_do_not_double_count_open_funding()
     test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist()
     test_adverse_basis_with_weak_funding_tries_profitable_unwind()

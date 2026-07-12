@@ -558,19 +558,27 @@ def run_paper_strategy_once(
             exit_row = row
             exit_estimate = None
             force_gentle_unwind = reason == "funding_captured_try_profitable_unwind"
-            full_exit = (
+            full_exit_estimate = None
+            full_exit_min_profit_usd = (
+                position.notional_usd * config.min_profit_to_full_exit_pct / 100
+                if config.gentle_unwind_enabled
+                else 0.0
+            )
+            full_exit = False
+            if (
                 not force_gentle_unwind
                 and row.notional_usd + 1e-8 >= position.notional_usd
                 and row.spot_exit_avg_price is not None
                 and row.perp_exit_avg_price is not None
-                and (
-                    not config.gentle_unwind_enabled
-                    or position.estimated_net_pnl_usd >= position.notional_usd * config.min_profit_to_full_exit_pct / 100
+            ):
+                full_exit_estimate = _estimate_exit_chunk(position, row, config, position.notional_usd)
+                full_exit = (
+                    full_exit_estimate is not None
+                    and full_exit_estimate.net_pnl_ex_funding_usd >= full_exit_min_profit_usd
                 )
-            )
             if full_exit:
                 exit_chunk = position.notional_usd
-                exit_estimate = _estimate_exit_chunk(position, row, config, exit_chunk)
+                exit_estimate = full_exit_estimate
             elif config.gentle_unwind_enabled:
                 partial = _choose_partial_close(
                     opportunities,
@@ -580,7 +588,7 @@ def run_paper_strategy_once(
                     position_notional_usd=position.notional_usd,
                     config=config,
                     require_profitable=True,
-                    require_ex_funding_profit=force_gentle_unwind,
+                    require_ex_funding_profit=True,
                 )
                 if partial is not None:
                     exit_chunk, exit_row, exit_estimate = partial
