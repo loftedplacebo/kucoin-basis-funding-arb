@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -298,6 +300,7 @@ def scan_once(
     config: KucoinBasisConvergenceConfig = DEFAULT_CONFIG,
     client: KucoinPublicClient | None = None,
 ) -> tuple[Path, list[ConvergenceOpportunityRow], list[str]]:
+    provided_client = client is not None
     client = client or KucoinPublicClient()
     config.data_dir.mkdir(parents=True, exist_ok=True)
     config.observations_dir.mkdir(parents=True, exist_ok=True)
@@ -311,13 +314,29 @@ def scan_once(
     rows: list[ConvergenceOpportunityRow] = []
     errors: list[str] = []
 
-    for pair in pairs:
-        try:
-            rows.extend(scan_pair(client, config, pair, contracts, now))
-        except Exception as exc:
-            errors.append(f"{pair.base}: {exc}")
+    if provided_client:
+        for pair in pairs:
+            try:
+                rows.extend(scan_pair(client, config, pair, contracts, now))
+            except Exception as exc:
+                errors.append(f"{pair.base}: {exc}")
+    else:
+        thread_local = threading.local()
+
+        def worker(pair):
+            if not hasattr(thread_local, "client"):
+                thread_local.client = KucoinPublicClient()
+            return scan_pair(thread_local.client, config, pair, contracts, now)
+
+        with ThreadPoolExecutor(max_workers=max(1, config.scan_max_workers)) as executor:
+            future_by_pair = {executor.submit(worker, pair): pair for pair in pairs}
+            for future in as_completed(future_by_pair):
+                pair = future_by_pair[future]
+                try:
+                    rows.extend(future.result())
+                except Exception as exc:
+                    errors.append(f"{pair.base}: {exc}")
 
     output_path = opportunity_file(config, now)
     append_opportunities(output_path, rows)
     return output_path, rows, errors
-

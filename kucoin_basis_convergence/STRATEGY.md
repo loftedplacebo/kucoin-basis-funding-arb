@@ -4,7 +4,7 @@ This strategy is separate from the funding-first paper strategy. It removes fund
 
 ## Core Recommendation
 
-Scan every active KuCoin spot USDT pair that also has an active USDT perpetual, every 60 seconds to start. I would not start at 30 seconds for the full universe until the VPS has proven API headroom, because every scan consumes two order book requests per symbol plus contract/symbol discovery. A 60 second scan is enough for paper discovery and avoids training the strategy around microstructure noise.
+Scan every active KuCoin spot USDT pair that also has an active USDT perpetual, every 60 seconds to start. The scanner uses a conservative worker pool so the full universe can finish close to the target cadence without immediately hammering KuCoin public APIs. I would not start at 30 seconds for the full universe until the VPS has proven API headroom, because every scan consumes two order book requests per symbol plus contract/symbol discovery. A 60 second scan is enough for paper discovery and avoids training the strategy around microstructure noise.
 
 If 60 seconds is stable for a few days, test 30 seconds on a whitelist of liquid/high-volatility bases rather than the full universe.
 
@@ -103,4 +103,3 @@ Important files:
 Treat the first week as data generation, not strategy validation. The first threshold set should be conservative, because crypto spot/perp basis tails are often caused by bad spot liquidity, stale prints, borrow/short constraints, or forced perp flow that can continue longer than expected.
 
 The most important metric is not raw basis range. It is realised basis PnL after executable entry and exit costs, excluding funding. If that number is not positive across many small trades, the apparent basis volatility is not monetisable.
-

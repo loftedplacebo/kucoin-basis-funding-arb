@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import math
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -9,6 +10,8 @@ from statistics import median
 from kucoin_basis_convergence.config import KucoinBasisConvergenceConfig
 from kucoin_basis_convergence.models import format_datetime, parse_float, utc_now
 
+
+_HISTORY_LOCK = threading.Lock()
 
 OBSERVATION_FIELDS = [
     "timestamp_utc",
@@ -62,30 +65,31 @@ def append_observation(
     if spot_mid is None or perp_mid is None or basis_pct is None:
         return
     path = observation_file(config, now)
-    file_exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=OBSERVATION_FIELDS)
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow(
-            {
-                "timestamp_utc": format_datetime(now or utc_now()),
-                "base": base,
-                "spot_symbol": spot_symbol,
-                "perp_symbol": perp_symbol,
-                "spot_mid": f"{spot_mid:.12f}",
-                "perp_mid": f"{perp_mid:.12f}",
-                "basis_pct": f"{basis_pct:.8f}",
-                "funding_rate_pct": "" if funding_rate_pct is None else f"{funding_rate_pct:.8f}",
-                "predicted_funding_rate_pct": ""
-                if predicted_funding_rate_pct is None
-                else f"{predicted_funding_rate_pct:.8f}",
-                "funding_time_utc": format_datetime(funding_time_utc),
-                "funding_interval_hours": ""
-                if funding_interval_hours is None
-                else f"{funding_interval_hours:.8f}",
-            }
-        )
+    with _HISTORY_LOCK:
+        file_exists = path.exists()
+        with path.open("a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=OBSERVATION_FIELDS)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(
+                {
+                    "timestamp_utc": format_datetime(now or utc_now()),
+                    "base": base,
+                    "spot_symbol": spot_symbol,
+                    "perp_symbol": perp_symbol,
+                    "spot_mid": f"{spot_mid:.12f}",
+                    "perp_mid": f"{perp_mid:.12f}",
+                    "basis_pct": f"{basis_pct:.8f}",
+                    "funding_rate_pct": "" if funding_rate_pct is None else f"{funding_rate_pct:.8f}",
+                    "predicted_funding_rate_pct": ""
+                    if predicted_funding_rate_pct is None
+                    else f"{predicted_funding_rate_pct:.8f}",
+                    "funding_time_utc": format_datetime(funding_time_utc),
+                    "funding_interval_hours": ""
+                    if funding_interval_hours is None
+                    else f"{funding_interval_hours:.8f}",
+                }
+            )
 
 
 def load_recent_basis_values(
@@ -96,14 +100,15 @@ def load_recent_basis_values(
 ) -> list[float]:
     values: list[float] = []
     files = sorted(config.observations_dir.glob("kucoin_basis_convergence_observations_*.csv"))
-    for path in files[-3:]:
-        with path.open("r", newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                if row.get("base") != base:
-                    continue
-                value = parse_float(row.get("basis_pct"))
-                if value is not None:
-                    values.append(value)
+    with _HISTORY_LOCK:
+        for path in files[-3:]:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("base") != base:
+                        continue
+                    value = parse_float(row.get("basis_pct"))
+                    if value is not None:
+                        values.append(value)
     lookback = limit or config.basis_history_lookback
     return values[-lookback:]
 
@@ -149,4 +154,3 @@ def calculate_basis_stats(
         max_pct=max_pct,
         trend_pct=trend_pct,
     )
-

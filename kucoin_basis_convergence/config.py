@@ -13,7 +13,8 @@ class KucoinBasisConvergenceConfig:
     approved_bases: tuple[str, ...] = ()
 
     orderbook_monitor_interval_seconds: float = 60.0
-    max_strategy_row_age_seconds: float = 180.0
+    scan_max_workers: int = 8
+    max_strategy_row_age_seconds: float = 600.0
 
     # Small-trade defaults. The goal is to learn across many independent events
     # instead of betting on one large basis snapback.
@@ -66,4 +67,3 @@ class KucoinBasisConvergenceConfig:
 
 
 DEFAULT_CONFIG = KucoinBasisConvergenceConfig()
-
