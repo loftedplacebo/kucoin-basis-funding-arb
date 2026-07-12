@@ -39,6 +39,15 @@ Print a paper summary:
 python kucoin_basis\print_summary.py
 ```
 
+Run the separate basis-convergence paper research loop:
+
+```powershell
+python kucoin_basis_convergence\run_scanner.py --loop --interval 60
+python kucoin_basis_convergence\run_paper_strategy.py --loop --interval 60
+```
+
+The convergence strategy is documented in `kucoin_basis_convergence/STRATEGY.md`.
+
 ## VPS Dashboard Access
 
 Clone the repo on the VPS:
@@ -100,11 +109,18 @@ Useful audit files:
 - `data/kucoin_basis/paper/fills.csv`: paper opens, adds, partial closes, and closes.
 - `data/kucoin_basis/paper/funding_events.csv`: booked funding events.
 
+The basis-convergence strategy writes separate files under:
+
+```text
+data/kucoin_basis_convergence/
+```
+
 ## Tests
 
 ```powershell
 python -m py_compile kucoin_basis\*.py core\*.py test_kucoin_basis_strategy.py
 python test_kucoin_basis_strategy.py
+python test_kucoin_basis_convergence_strategy.py
 ```
 
 ## Current Paper Rules
