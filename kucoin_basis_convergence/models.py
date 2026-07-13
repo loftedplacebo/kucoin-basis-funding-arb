@@ -63,6 +63,8 @@ class ConvergenceOpportunityRow:
     spot_ask: Optional[float]
     perp_bid: Optional[float]
     perp_ask: Optional[float]
+    spot_spread_pct: Optional[float]
+    perp_spread_pct: Optional[float]
     basis_pct: Optional[float]
     notional_usd: float
     spot_entry_slippage_pct: Optional[float]
@@ -80,6 +82,9 @@ class ConvergenceOpportunityRow:
     basis_zscore: Optional[float]
     basis_percentile: Optional[float]
     basis_trend_pct: Optional[float]
+    basis_change_5m_pct: Optional[float]
+    basis_change_15m_pct: Optional[float]
+    basis_change_60m_pct: Optional[float]
     basis_target_pct: Optional[float]
     gross_convergence_pct: Optional[float]
     expected_convergence_pct: Optional[float]
@@ -118,6 +123,8 @@ class ConvergenceOpportunityRow:
             spot_ask=parse_float(row.get("spot_ask")),
             perp_bid=parse_float(row.get("perp_bid")),
             perp_ask=parse_float(row.get("perp_ask")),
+            spot_spread_pct=parse_float(row.get("spot_spread_pct")),
+            perp_spread_pct=parse_float(row.get("perp_spread_pct")),
             basis_pct=parse_float(row.get("basis_pct")),
             notional_usd=parse_float(row.get("notional_usd"), 0.0) or 0.0,
             spot_entry_slippage_pct=parse_float(row.get("spot_entry_slippage_pct")),
@@ -135,6 +142,9 @@ class ConvergenceOpportunityRow:
             basis_zscore=parse_float(row.get("basis_zscore")),
             basis_percentile=parse_float(row.get("basis_percentile")),
             basis_trend_pct=parse_float(row.get("basis_trend_pct")),
+            basis_change_5m_pct=parse_float(row.get("basis_change_5m_pct")),
+            basis_change_15m_pct=parse_float(row.get("basis_change_15m_pct")),
+            basis_change_60m_pct=parse_float(row.get("basis_change_60m_pct")),
             basis_target_pct=parse_float(row.get("basis_target_pct")),
             gross_convergence_pct=parse_float(row.get("gross_convergence_pct")),
             expected_convergence_pct=parse_float(row.get("expected_convergence_pct")),
@@ -146,4 +156,3 @@ class ConvergenceOpportunityRow:
             spot_exit_avg_price=parse_float(row.get("spot_exit_avg_price")),
             perp_exit_avg_price=parse_float(row.get("perp_exit_avg_price")),
         )
-

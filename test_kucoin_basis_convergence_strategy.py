@@ -35,6 +35,8 @@ def make_row(**overrides) -> ConvergenceOpportunityRow:
         "spot_ask": 100.0,
         "perp_bid": 102.0,
         "perp_ask": 102.1,
+        "spot_spread_pct": 0.1,
+        "perp_spread_pct": 0.098,
         "basis_pct": 2.0,
         "notional_usd": 25.0,
         "spot_entry_slippage_pct": 0.0,
@@ -52,6 +54,9 @@ def make_row(**overrides) -> ConvergenceOpportunityRow:
         "basis_zscore": 2.66,
         "basis_percentile": 95.0,
         "basis_trend_pct": 0.1,
+        "basis_change_5m_pct": 0.2,
+        "basis_change_15m_pct": 0.5,
+        "basis_change_60m_pct": 1.0,
         "basis_target_pct": 0.0,
         "gross_convergence_pct": 2.0,
         "expected_convergence_pct": 1.0,
@@ -118,4 +123,3 @@ def test_convergence_strategy_opens_then_closes_on_neutralised_profit():
 if __name__ == "__main__":
     test_convergence_strategy_opens_then_closes_on_neutralised_profit()
     print("kucoin basis convergence strategy tests passed")
-

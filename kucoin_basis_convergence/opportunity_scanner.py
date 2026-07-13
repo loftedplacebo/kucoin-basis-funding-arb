@@ -14,7 +14,7 @@ from kucoin_basis_convergence.basis_history import (
     append_observation,
     calculate_basis_stats,
     calculate_basis_stats_from_values,
-    load_basis_history_by_base,
+    load_basis_history_points_by_base,
 )
 from kucoin_basis_convergence.config import DEFAULT_CONFIG, KucoinBasisConvergenceConfig
 from kucoin_basis_convergence.models import ConvergenceOpportunityRow, utc_now
@@ -34,6 +34,8 @@ OPPORTUNITY_FIELDS = [
     "spot_ask",
     "perp_bid",
     "perp_ask",
+    "spot_spread_pct",
+    "perp_spread_pct",
     "basis_pct",
     "notional_usd",
     "spot_entry_slippage_pct",
@@ -51,6 +53,9 @@ OPPORTUNITY_FIELDS = [
     "basis_zscore",
     "basis_percentile",
     "basis_trend_pct",
+    "basis_change_5m_pct",
+    "basis_change_15m_pct",
+    "basis_change_60m_pct",
     "basis_target_pct",
     "gross_convergence_pct",
     "expected_convergence_pct",
@@ -99,6 +104,32 @@ def _contracts_by_symbol_from_contracts(contracts: list[dict]) -> dict[str, dict
 
 def _fixed_entry_cost_pct(config: KucoinBasisConvergenceConfig) -> float:
     return config.estimated_spot_taker_fee_pct + config.estimated_perp_taker_fee_pct
+
+
+def _book_spread_pct(bid: float | None, ask: float | None) -> float | None:
+    if bid is None or ask is None or bid <= 0:
+        return None
+    return ((ask / bid) - 1) * 100
+
+
+def _basis_change_since(
+    points: list[tuple[datetime, float]],
+    *,
+    current_basis_pct: float | None,
+    now: datetime,
+    horizon_seconds: int,
+) -> float | None:
+    if current_basis_pct is None:
+        return None
+    cutoff = now.timestamp() - horizon_seconds
+    anchor = None
+    for timestamp, value in reversed(points):
+        if timestamp.timestamp() <= cutoff:
+            anchor = value
+            break
+    if anchor is None:
+        return None
+    return current_basis_pct - anchor
 
 
 def _target_and_convergence(
@@ -176,7 +207,7 @@ def scan_pair(
     pair,
     contracts_by_symbol: dict[str, dict],
     now: datetime,
-    basis_history_by_base: dict[str, list[float]] | None = None,
+    basis_history_by_base: dict[str, list[tuple[datetime, float]]] | None = None,
     basis_history_lock: threading.Lock | None = None,
 ) -> list[ConvergenceOpportunityRow]:
     funding = fetch_funding_snapshot(client, pair, contracts_by_symbol)
@@ -188,9 +219,44 @@ def scan_pair(
     spot_ask = spot_book.asks[0].price if spot_book.asks else None
     perp_bid = perp_book.bids[0].price if perp_book.bids else None
     perp_ask = perp_book.asks[0].price if perp_book.asks else None
+    spot_spread_pct = _book_spread_pct(spot_bid, spot_ask)
+    perp_spread_pct = _book_spread_pct(perp_bid, perp_ask)
     spot_mid = (spot_bid + spot_ask) / 2 if spot_bid and spot_ask else None
     perp_mid = (perp_bid + perp_ask) / 2 if perp_bid and perp_ask else None
     basis_pct = ((perp_mid / spot_mid) - 1) * 100 if spot_mid and perp_mid and spot_mid > 0 else None
+
+    basis_change_5m_pct = None
+    basis_change_15m_pct = None
+    basis_change_60m_pct = None
+    if basis_history_by_base is None:
+        basis_stats = calculate_basis_stats(config=config, base=pair.base, current_basis_pct=basis_pct)
+    else:
+        lock = basis_history_lock or threading.Lock()
+        with lock:
+            points = basis_history_by_base.setdefault(pair.base, [])
+            basis_change_5m_pct = _basis_change_since(
+                points,
+                current_basis_pct=basis_pct,
+                now=now,
+                horizon_seconds=5 * 60,
+            )
+            basis_change_15m_pct = _basis_change_since(
+                points,
+                current_basis_pct=basis_pct,
+                now=now,
+                horizon_seconds=15 * 60,
+            )
+            basis_change_60m_pct = _basis_change_since(
+                points,
+                current_basis_pct=basis_pct,
+                now=now,
+                horizon_seconds=60 * 60,
+            )
+            if basis_pct is not None:
+                points.append((now, basis_pct))
+                if len(points) > config.basis_history_lookback:
+                    del points[: len(points) - config.basis_history_lookback]
+            basis_stats = calculate_basis_stats_from_values([value for _, value in points], basis_pct)
 
     append_observation(
         config=config,
@@ -204,19 +270,14 @@ def scan_pair(
         predicted_funding_rate_pct=funding.predicted_funding_rate_pct,
         funding_time_utc=funding.funding_time_utc,
         funding_interval_hours=funding.funding_interval_hours,
+        spot_bid=spot_bid,
+        spot_ask=spot_ask,
+        spot_spread_pct=spot_spread_pct,
+        perp_bid=perp_bid,
+        perp_ask=perp_ask,
+        perp_spread_pct=perp_spread_pct,
         now=now,
     )
-    if basis_history_by_base is None:
-        basis_stats = calculate_basis_stats(config=config, base=pair.base, current_basis_pct=basis_pct)
-    else:
-        lock = basis_history_lock or threading.Lock()
-        with lock:
-            values = basis_history_by_base.setdefault(pair.base, [])
-            if basis_pct is not None:
-                values.append(basis_pct)
-                if len(values) > config.basis_history_lookback:
-                    del values[: len(values) - config.basis_history_lookback]
-            basis_stats = calculate_basis_stats_from_values(values, basis_pct)
 
     rows: list[ConvergenceOpportunityRow] = []
     for notional in config.chunk_ladder_usd:
@@ -281,6 +342,8 @@ def scan_pair(
                     spot_ask=spot_ask,
                     perp_bid=perp_bid,
                     perp_ask=perp_ask,
+                    spot_spread_pct=spot_spread_pct,
+                    perp_spread_pct=perp_spread_pct,
                     basis_pct=basis_pct,
                     notional_usd=notional,
                     spot_entry_slippage_pct=estimate.spot_entry.slippage_pct,
@@ -298,6 +361,9 @@ def scan_pair(
                     basis_zscore=basis_stats.zscore,
                     basis_percentile=basis_stats.percentile,
                     basis_trend_pct=basis_stats.trend_pct,
+                    basis_change_5m_pct=basis_change_5m_pct,
+                    basis_change_15m_pct=basis_change_15m_pct,
+                    basis_change_60m_pct=basis_change_60m_pct,
                     basis_target_pct=basis_target_pct,
                     gross_convergence_pct=gross_convergence_pct,
                     expected_convergence_pct=expected_convergence_pct,
@@ -329,7 +395,7 @@ def scan_once(
     contracts_list = client.get_active_contracts()
     contracts = _contracts_by_symbol_from_contracts(contracts_list)
     pairs = build_symbol_pairs(client.get_spot_symbols(), contracts_list, config)
-    basis_history_by_base = load_basis_history_by_base(config=config, limit=config.basis_history_lookback)
+    basis_history_by_base = load_basis_history_points_by_base(config=config, limit=config.basis_history_lookback)
     basis_history_lock = threading.Lock()
     rows: list[ConvergenceOpportunityRow] = []
     errors: list[str] = []

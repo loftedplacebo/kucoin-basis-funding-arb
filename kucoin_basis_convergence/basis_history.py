@@ -5,6 +5,7 @@ import math
 import threading
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
@@ -19,6 +20,12 @@ OBSERVATION_FIELDS = [
     "base",
     "spot_symbol",
     "perp_symbol",
+    "spot_bid",
+    "spot_ask",
+    "spot_spread_pct",
+    "perp_bid",
+    "perp_ask",
+    "perp_spread_pct",
     "spot_mid",
     "perp_mid",
     "basis_pct",
@@ -61,6 +68,12 @@ def append_observation(
     predicted_funding_rate_pct: float | None,
     funding_time_utc,
     funding_interval_hours: float | None,
+    spot_bid: float | None = None,
+    spot_ask: float | None = None,
+    spot_spread_pct: float | None = None,
+    perp_bid: float | None = None,
+    perp_ask: float | None = None,
+    perp_spread_pct: float | None = None,
     now=None,
 ) -> None:
     if spot_mid is None or perp_mid is None or basis_pct is None:
@@ -68,6 +81,14 @@ def append_observation(
     path = observation_file(config, now)
     with _HISTORY_LOCK:
         file_exists = path.exists()
+        if file_exists:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                existing_fieldnames = csv.DictReader(f).fieldnames or []
+            if existing_fieldnames != OBSERVATION_FIELDS:
+                config.archive_dir.mkdir(parents=True, exist_ok=True)
+                archive_path = config.archive_dir / f"{path.stem}_schema_mismatch_{utc_now():%H%M%S}{path.suffix}"
+                path.replace(archive_path)
+                file_exists = False
         with path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=OBSERVATION_FIELDS)
             if not file_exists:
@@ -78,6 +99,12 @@ def append_observation(
                     "base": base,
                     "spot_symbol": spot_symbol,
                     "perp_symbol": perp_symbol,
+                    "spot_bid": "" if spot_bid is None else f"{spot_bid:.12f}",
+                    "spot_ask": "" if spot_ask is None else f"{spot_ask:.12f}",
+                    "spot_spread_pct": "" if spot_spread_pct is None else f"{spot_spread_pct:.8f}",
+                    "perp_bid": "" if perp_bid is None else f"{perp_bid:.12f}",
+                    "perp_ask": "" if perp_ask is None else f"{perp_ask:.12f}",
+                    "perp_spread_pct": "" if perp_spread_pct is None else f"{perp_spread_pct:.8f}",
                     "spot_mid": f"{spot_mid:.12f}",
                     "perp_mid": f"{perp_mid:.12f}",
                     "basis_pct": f"{basis_pct:.8f}",
@@ -112,6 +139,34 @@ def load_recent_basis_values(
                         values.append(value)
     lookback = limit or config.basis_history_lookback
     return values[-lookback:]
+
+
+def load_basis_history_points_by_base(
+    *,
+    config: KucoinBasisConvergenceConfig,
+    limit: int | None = None,
+) -> dict[str, list[tuple[datetime, float]]]:
+    lookback = limit or config.basis_history_lookback
+    values_by_base: dict[str, deque[tuple[datetime, float]]] = {}
+    files = sorted(config.observations_dir.glob("kucoin_basis_convergence_observations_*.csv"))
+    with _HISTORY_LOCK:
+        for path in files[-3:]:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    base = row.get("base")
+                    timestamp = row.get("timestamp_utc")
+                    value = parse_float(row.get("basis_pct"))
+                    if not base or not timestamp or value is None:
+                        continue
+                    try:
+                        parsed_timestamp = datetime.fromisoformat(str(timestamp))
+                    except ValueError:
+                        continue
+                    if parsed_timestamp.tzinfo is None:
+                        parsed_timestamp = parsed_timestamp.replace(tzinfo=timezone.utc)
+                    values = values_by_base.setdefault(base, deque(maxlen=lookback))
+                    values.append((parsed_timestamp, value))
+    return {base: list(values) for base, values in values_by_base.items()}
 
 
 def load_basis_history_by_base(

@@ -91,6 +91,7 @@ Important files:
 
 - `observations/kucoin_basis_convergence_observations_YYYYMMDD.csv`: one raw basis observation per pair per scan.
 - `opportunities/kucoin_basis_convergence_opportunities_YYYYMMDD.csv`: chunk-level candidate rows with costs, stats, decisions, and reasons.
+- The research schema intentionally records market-quality and momentum context on every row: spot/perp top-of-book spreads, 5m/15m/60m basis changes, rolling mean/median/std, z-score, percentile, trend, executable entry/exit prices, slippage, round-trip costs, fillability, decision, and rejection reason.
 - `paper/positions.csv`: open and closed paper positions.
 - `paper/fills.csv`: opens, adds, partial closes, and closes.
 - `paper/decisions.csv`: every entry/exit decision, including rejections.
