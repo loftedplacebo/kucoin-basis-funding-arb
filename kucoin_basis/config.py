@@ -46,6 +46,8 @@ class KucoinBasisConfig:
     basis_convergence_haircut: float = 0.50
     gentle_unwind_enabled: bool = True
     gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
+    funding_harvest_unwind_chunk_usd: float = 100.0
+    min_funding_harvest_unwind_profit_usd: float = 0.25
     min_profit_to_full_exit_pct: float = 0.02
     juicy_hold_funding_rate_pct: float = 1.00
     post_close_reentry_cooldown_minutes: float = 60.0

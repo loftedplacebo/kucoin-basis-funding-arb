@@ -418,6 +418,37 @@ def _choose_partial_close(
     )
 
 
+def _choose_funding_harvest_close(
+    rows: list[OpportunityRow],
+    *,
+    base: str,
+    direction: str,
+    position: PaperPosition,
+    config: KucoinBasisConfig,
+) -> tuple[float, OpportunityRow, ExitEstimate] | None:
+    if position.funding_events_captured <= 0 or position.realised_funding_pnl_usd <= 0:
+        return None
+    chunk = min(config.funding_harvest_unwind_chunk_usd, position.notional_usd)
+    if chunk <= 0:
+        return None
+    row = _choose_full_close_row(
+        rows,
+        base=base,
+        direction=direction,
+        notional_usd=chunk,
+    )
+    if row is None:
+        return None
+    estimate = _estimate_exit_chunk(position, row, config, chunk)
+    if estimate is None:
+        return None
+    if estimate.net_pnl_ex_funding_usd >= 0:
+        return None
+    if estimate.net_pnl_usd < config.min_funding_harvest_unwind_profit_usd:
+        return None
+    return chunk, row, estimate
+
+
 def _reduce_position(position: PaperPosition, chunk_notional_usd: float) -> None:
     if chunk_notional_usd >= position.notional_usd - 1e-8:
         position.notional_usd = 0.0
@@ -592,6 +623,21 @@ def run_paper_strategy_once(
                 )
                 if partial is not None:
                     exit_chunk, exit_row, exit_estimate = partial
+                elif reason in {
+                    "funding_captured_next_funding_below_threshold",
+                    "funding_weak_basis_adverse_try_unwind",
+                    "funding_captured_holding_edge_weak",
+                }:
+                    harvest = _choose_funding_harvest_close(
+                        opportunities,
+                        base=position.base,
+                        direction=position.direction,
+                        position=position,
+                        config=config,
+                    )
+                    if harvest is not None:
+                        exit_chunk, exit_row, exit_estimate = harvest
+                        reason = "funding_harvest_profitable_unwind"
 
             if exit_chunk is None or exit_estimate is None:
                 store.append_decision(

@@ -19,7 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 from core.symbols import normalise_symbol, split_standard_symbol
 from kucoin_basis.config import DEFAULT_CONFIG, KucoinBasisConfig
 from kucoin_basis.kucoin_public_client import KucoinPublicClient
-from kucoin_basis.models import parse_datetime, parse_float
+from kucoin_basis.models import OpportunityRow, parse_datetime, parse_float
+from kucoin_basis.paper_strategy import _estimate_exit_chunk
 from kucoin_basis.paper_store import PaperStore
 
 
@@ -372,7 +373,10 @@ HTML = """<!doctype html>
               <th>Realised funding</th>
               <th>Funding cover</th>
               <th>Basis PnL</th>
-              <th>Net PnL</th>
+              <th>Full-exit mark</th>
+              <th>$100 ex fund</th>
+              <th>$100 all-in</th>
+              <th>Unwind status</th>
               <th>Next funding</th>
               <th>Last decision</th>
               <th>Symbol cap</th>
@@ -392,7 +396,9 @@ HTML = """<!doctype html>
               <th>Base</th>
               <th>Direction</th>
               <th>Notional</th>
-              <th>Realised PnL</th>
+              <th>Trade PnL</th>
+              <th>Funding alloc</th>
+              <th>All-in PnL</th>
               <th>Reason</th>
             </tr>
           </thead>
@@ -679,6 +685,9 @@ HTML = """<!doctype html>
           <td>${fmtRatio(position.funding_coverage_ratio)}</td>
           <td>${fmtMoney(position.unrealised_basis_pnl_usd)}</td>
           <td class="${pnl >= 0 ? "positive" : "negative"}">${fmtMoney(pnl)}</td>
+          <td class="${Number(position.next_unwind_pnl_ex_funding_usd || 0) >= 0 ? "positive" : "negative"}">${fmtMoney(position.next_unwind_pnl_ex_funding_usd)}</td>
+          <td class="${Number(position.next_unwind_pnl_usd || 0) >= 0 ? "positive" : "negative"}">${fmtMoney(position.next_unwind_pnl_usd)}</td>
+          <td>${position.next_unwind_status || ""}</td>
           <td>${dateCell(position.next_funding_time)}</td>
           <td>${position.latest_exit_reason || ""}</td>
           <td>${fmtMoney(position.symbol_usage_usd)} / ${fmtMoney(positionsPayload.maxSymbolNotionalUsd)}</td>
@@ -689,7 +698,9 @@ HTML = """<!doctype html>
 
       fillRowsEl.innerHTML = "";
       for (const fill of positionsPayload.recentFills || []) {
-        const pnl = Number(fill.realised_pnl_usd || 0);
+        const tradePnl = Number(fill.realised_pnl_usd || 0);
+        const fundingPnl = Number(fill.realised_funding_pnl_usd || 0);
+        const allInPnl = tradePnl + fundingPnl;
         const tr = document.createElement("tr");
         tr.innerHTML = `
           <td>${dateCell(fill.timestamp_utc, true)}</td>
@@ -697,7 +708,9 @@ HTML = """<!doctype html>
           <td><strong>${fill.base || ""}</strong></td>
           <td>${fill.direction || ""}</td>
           <td>${fmtMoney(fill.notional_usd)}</td>
-          <td class="${pnl >= 0 ? "positive" : "negative"}">${fmtMoney(pnl)}</td>
+          <td class="${tradePnl >= 0 ? "positive" : "negative"}">${fmtMoney(tradePnl)}</td>
+          <td class="${fundingPnl >= 0 ? "positive" : "negative"}">${fmtMoney(fundingPnl)}</td>
+          <td class="${allInPnl >= 0 ? "positive" : "negative"}">${fmtMoney(allInPnl)}</td>
           <td>${fill.reason || ""}</td>
         `;
         fillRowsEl.appendChild(tr);
@@ -708,7 +721,11 @@ HTML = """<!doctype html>
       const metrics = [
         ["Open positions", summaryPayload.openPositions],
         ["Open notional", fmtMoney(summaryPayload.totalOpenNotionalUsd)],
-        ["Open basis/fees PnL", fmtMoney(summaryPayload.estimatedOpenPnlExFundingUsd)],
+        ["Open funding banked", fmtMoney(summaryPayload.openFundingBankedUsd)],
+        ["Open full-exit ex funding", fmtMoney(summaryPayload.estimatedOpenPnlExFundingUsd)],
+        ["Open full-exit all-in", fmtMoney(summaryPayload.estimatedOpenFullExitAllInPnlUsd)],
+        ["Open next $100 all-in", fmtMoney(summaryPayload.estimatedOpenNextUnwindPnlUsd)],
+        ["Open next $100 ex funding", fmtMoney(summaryPayload.estimatedOpenNextUnwindExFundingPnlUsd)],
         ["Total PnL incl open", fmtMoney(summaryPayload.totalPnlInclOpenUsd)],
         ["Total realised PnL", fmtMoney(summaryPayload.totalRealisedPnlUsd)],
         ["Total funding PnL", fmtMoney(summaryPayload.totalRealisedFundingPnlUsd)],
@@ -1058,6 +1075,68 @@ def _latest_opportunity_rows(config: KucoinBasisConfig) -> tuple[Path | None, li
     return path, latest_rows
 
 
+def _latest_opportunity_objects_by_position(config: KucoinBasisConfig) -> dict[tuple[str, str], list[OpportunityRow]]:
+    _, rows = _latest_opportunity_rows(config)
+    by_position: dict[tuple[str, str], list[OpportunityRow]] = {}
+    for row in rows:
+        try:
+            opportunity = OpportunityRow.from_csv_row(row)
+        except Exception:
+            continue
+        by_position.setdefault((opportunity.base, opportunity.direction), []).append(opportunity)
+    for candidates in by_position.values():
+        candidates.sort(key=lambda item: item.notional_usd)
+    return by_position
+
+
+def _position_unwind_estimates(position, rows: list[OpportunityRow], config: KucoinBasisConfig) -> dict[str, str]:
+    result = {
+        "next_unwind_chunk_usd": "",
+        "next_unwind_pnl_ex_funding_usd": "",
+        "next_unwind_pnl_usd": "",
+        "next_unwind_funding_pnl_usd": "",
+        "next_unwind_close_cost_usd": "",
+        "next_unwind_status": "no row",
+    }
+    if not rows or position.notional_usd <= 0:
+        return result
+
+    chunk = min(config.funding_harvest_unwind_chunk_usd, position.notional_usd)
+    row = next(
+        (
+            item
+            for item in rows
+            if item.notional_usd + 1e-8 >= chunk
+            and item.spot_exit_avg_price is not None
+            and item.perp_exit_avg_price is not None
+        ),
+        None,
+    )
+    if row is None:
+        return result
+
+    estimate = _estimate_exit_chunk(position, row, config, chunk)
+    if estimate is None:
+        return result
+
+    if estimate.net_pnl_ex_funding_usd >= 0:
+        status = "basis profitable"
+    elif estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd:
+        status = "funding harvest"
+    else:
+        status = "hold"
+
+    result.update({
+        "next_unwind_chunk_usd": f"{chunk:.8f}",
+        "next_unwind_pnl_ex_funding_usd": f"{estimate.net_pnl_ex_funding_usd:.8f}",
+        "next_unwind_pnl_usd": f"{estimate.net_pnl_usd:.8f}",
+        "next_unwind_funding_pnl_usd": f"{estimate.funding_pnl_usd:.8f}",
+        "next_unwind_close_cost_usd": f"{estimate.close_cost_usd:.8f}",
+        "next_unwind_status": status,
+    })
+    return result
+
+
 def _shortlist_display_rows(rows: list[dict]) -> list[dict]:
     best_by_symbol_direction = {}
     for row in rows:
@@ -1270,6 +1349,7 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         if position.status == "OPEN":
             open_notional_by_base[position.base] += position.notional_usd
     decisions = _load_csv(store.decisions_path)
+    latest_rows_by_position = _latest_opportunity_objects_by_position(config)
     latest_exit_reason = {}
     for decision in decisions:
         if decision.get("decision_type") == "EXIT":
@@ -1304,6 +1384,11 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
             row["funding_state"] = "no funding time"
         row["latest_exit_reason"] = latest_exit_reason.get(position.position_id, "")
         row["symbol_usage_usd"] = f"{open_notional_by_base.get(position.base, 0.0):.8f}"
+        row.update(_position_unwind_estimates(
+            position,
+            latest_rows_by_position.get((position.base, position.direction), []),
+            config,
+        ))
         positions.append(row)
     positions.sort(key=lambda item: (item.get("status") != "OPEN", item.get("base", ""), item.get("direction", "")))
     fills = _load_csv(store.fills_path)
@@ -1327,6 +1412,7 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     decisions = _load_csv(store.decisions_path)
     active_cooldowns = store.load_active_cooldowns(now)
     latest_path, latest_rows = _latest_opportunity_rows(config)
+    latest_rows_by_position = _latest_opportunity_objects_by_position(config)
     corrected_trade_pnl_rows = _corrected_trade_pnl_rows(fills, funding_events)
 
     realised_funding_today = sum(
@@ -1348,6 +1434,20 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         for row in corrected_trade_pnl_rows
     )
     estimated_open_pnl = sum(_open_pnl_ex_funding(position) for position in open_positions)
+    estimated_open_full_exit_all_in = sum(position.estimated_net_pnl_usd for position in open_positions)
+    estimated_open_next_unwind_pnl = 0.0
+    estimated_open_next_unwind_ex_funding_pnl = 0.0
+    open_funding_banked = sum(position.realised_funding_pnl_usd for position in open_positions)
+    for position in open_positions:
+        unwind = _position_unwind_estimates(
+            position,
+            latest_rows_by_position.get((position.base, position.direction), []),
+            config,
+        )
+        estimated_open_next_unwind_pnl += parse_float(unwind.get("next_unwind_pnl_usd"), 0.0) or 0.0
+        estimated_open_next_unwind_ex_funding_pnl += (
+            parse_float(unwind.get("next_unwind_pnl_ex_funding_usd"), 0.0) or 0.0
+        )
     realised_total = realised_funding_total + realised_trade_total
     entry_rejections = Counter(
         row.get("reason", "")
@@ -1366,6 +1466,10 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         "totalOpenNotionalUsd": sum(position.notional_usd for position in open_positions),
         "estimatedOpenPnlUsd": estimated_open_pnl,
         "estimatedOpenPnlExFundingUsd": estimated_open_pnl,
+        "estimatedOpenFullExitAllInPnlUsd": estimated_open_full_exit_all_in,
+        "estimatedOpenNextUnwindPnlUsd": estimated_open_next_unwind_pnl,
+        "estimatedOpenNextUnwindExFundingPnlUsd": estimated_open_next_unwind_ex_funding_pnl,
+        "openFundingBankedUsd": open_funding_banked,
         "totalRealisedFundingPnlUsd": realised_funding_total,
         "totalRealisedTradePnlUsd": realised_trade_total,
         "totalRealisedPnlUsd": realised_total,
