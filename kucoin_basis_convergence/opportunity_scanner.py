@@ -9,8 +9,13 @@ from pathlib import Path
 from kucoin_basis.funding import fetch_funding_snapshot
 from kucoin_basis.kucoin_public_client import KucoinPublicClient
 from kucoin_basis.orderbook import estimate_basis_round_trip
-from kucoin_basis.symbols import discover_symbol_pairs, standard_symbol_for_base
-from kucoin_basis_convergence.basis_history import append_observation, calculate_basis_stats
+from kucoin_basis.symbols import build_symbol_pairs, standard_symbol_for_base
+from kucoin_basis_convergence.basis_history import (
+    append_observation,
+    calculate_basis_stats,
+    calculate_basis_stats_from_values,
+    load_basis_history_by_base,
+)
 from kucoin_basis_convergence.config import DEFAULT_CONFIG, KucoinBasisConvergenceConfig
 from kucoin_basis_convergence.models import ConvergenceOpportunityRow, utc_now
 
@@ -84,10 +89,10 @@ def append_opportunities(path: Path, rows: list[ConvergenceOpportunityRow]) -> N
             writer.writerow({field: row.to_csv_row().get(field, "") for field in OPPORTUNITY_FIELDS})
 
 
-def _contracts_by_symbol(client: KucoinPublicClient) -> dict[str, dict]:
+def _contracts_by_symbol_from_contracts(contracts: list[dict]) -> dict[str, dict]:
     return {
         str(contract.get("symbol")): contract
-        for contract in client.get_active_contracts()
+        for contract in contracts
         if contract.get("symbol")
     }
 
@@ -171,6 +176,8 @@ def scan_pair(
     pair,
     contracts_by_symbol: dict[str, dict],
     now: datetime,
+    basis_history_by_base: dict[str, list[float]] | None = None,
+    basis_history_lock: threading.Lock | None = None,
 ) -> list[ConvergenceOpportunityRow]:
     funding = fetch_funding_snapshot(client, pair, contracts_by_symbol)
     standard_symbol = standard_symbol_for_base(pair.base)
@@ -199,7 +206,17 @@ def scan_pair(
         funding_interval_hours=funding.funding_interval_hours,
         now=now,
     )
-    basis_stats = calculate_basis_stats(config=config, base=pair.base, current_basis_pct=basis_pct)
+    if basis_history_by_base is None:
+        basis_stats = calculate_basis_stats(config=config, base=pair.base, current_basis_pct=basis_pct)
+    else:
+        lock = basis_history_lock or threading.Lock()
+        with lock:
+            values = basis_history_by_base.setdefault(pair.base, [])
+            if basis_pct is not None:
+                values.append(basis_pct)
+                if len(values) > config.basis_history_lookback:
+                    del values[: len(values) - config.basis_history_lookback]
+            basis_stats = calculate_basis_stats_from_values(values, basis_pct)
 
     rows: list[ConvergenceOpportunityRow] = []
     for notional in config.chunk_ladder_usd:
@@ -309,15 +326,28 @@ def scan_once(
     config.archive_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc)
-    contracts = _contracts_by_symbol(client)
-    pairs = discover_symbol_pairs(client, config)
+    contracts_list = client.get_active_contracts()
+    contracts = _contracts_by_symbol_from_contracts(contracts_list)
+    pairs = build_symbol_pairs(client.get_spot_symbols(), contracts_list, config)
+    basis_history_by_base = load_basis_history_by_base(config=config, limit=config.basis_history_lookback)
+    basis_history_lock = threading.Lock()
     rows: list[ConvergenceOpportunityRow] = []
     errors: list[str] = []
 
     if provided_client:
         for pair in pairs:
             try:
-                rows.extend(scan_pair(client, config, pair, contracts, now))
+                rows.extend(
+                    scan_pair(
+                        client,
+                        config,
+                        pair,
+                        contracts,
+                        now,
+                        basis_history_by_base,
+                        basis_history_lock,
+                    )
+                )
             except Exception as exc:
                 errors.append(f"{pair.base}: {exc}")
     else:
@@ -326,7 +356,15 @@ def scan_once(
         def worker(pair):
             if not hasattr(thread_local, "client"):
                 thread_local.client = KucoinPublicClient()
-            return scan_pair(thread_local.client, config, pair, contracts, now)
+            return scan_pair(
+                thread_local.client,
+                config,
+                pair,
+                contracts,
+                now,
+                basis_history_by_base,
+                basis_history_lock,
+            )
 
         with ThreadPoolExecutor(max_workers=max(1, config.scan_max_workers)) as executor:
             future_by_pair = {executor.submit(worker, pair): pair for pair in pairs}

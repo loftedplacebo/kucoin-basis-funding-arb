@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import math
 import threading
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
@@ -113,13 +114,31 @@ def load_recent_basis_values(
     return values[-lookback:]
 
 
-def calculate_basis_stats(
+def load_basis_history_by_base(
     *,
     config: KucoinBasisConvergenceConfig,
-    base: str,
+    limit: int | None = None,
+) -> dict[str, list[float]]:
+    lookback = limit or config.basis_history_lookback
+    values_by_base: dict[str, deque[float]] = {}
+    files = sorted(config.observations_dir.glob("kucoin_basis_convergence_observations_*.csv"))
+    with _HISTORY_LOCK:
+        for path in files[-3:]:
+            with path.open("r", newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    base = row.get("base")
+                    value = parse_float(row.get("basis_pct"))
+                    if not base or value is None:
+                        continue
+                    values = values_by_base.setdefault(base, deque(maxlen=lookback))
+                    values.append(value)
+    return {base: list(values) for base, values in values_by_base.items()}
+
+
+def calculate_basis_stats_from_values(
+    values: list[float],
     current_basis_pct: float | None,
 ) -> BasisStats:
-    values = load_recent_basis_values(config=config, base=base, limit=config.basis_history_lookback)
     count = len(values)
     if count == 0:
         return BasisStats(count, None, None, None, None, None, None, None, None)
@@ -154,3 +173,13 @@ def calculate_basis_stats(
         max_pct=max_pct,
         trend_pct=trend_pct,
     )
+
+
+def calculate_basis_stats(
+    *,
+    config: KucoinBasisConvergenceConfig,
+    base: str,
+    current_basis_pct: float | None,
+) -> BasisStats:
+    values = load_recent_basis_values(config=config, base=base, limit=config.basis_history_lookback)
+    return calculate_basis_stats_from_values(values, current_basis_pct)

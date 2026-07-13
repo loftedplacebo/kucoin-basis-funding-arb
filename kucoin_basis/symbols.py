@@ -11,13 +11,11 @@ def standard_symbol_for_base(base: str) -> str:
     return f"{base.upper()}USDT"
 
 
-def discover_symbol_pairs(
-    client: KucoinPublicClient,
+def build_symbol_pairs(
+    spot_symbols: list[dict],
+    contracts: list[dict],
     config: KucoinBasisConfig,
 ) -> list[SymbolPair]:
-    spot_symbols = client.get_spot_symbols()
-    contracts = client.get_active_contracts()
-
     active_spot_symbols = {}
     for item in spot_symbols:
         if item.get("quoteCurrency") != "USDT":
@@ -53,3 +51,12 @@ def discover_symbol_pairs(
             )
         )
     return pairs
+
+
+def discover_symbol_pairs(
+    client: KucoinPublicClient,
+    config: KucoinBasisConfig,
+) -> list[SymbolPair]:
+    spot_symbols = client.get_spot_symbols()
+    contracts = client.get_active_contracts()
+    return build_symbol_pairs(spot_symbols, contracts, config)
