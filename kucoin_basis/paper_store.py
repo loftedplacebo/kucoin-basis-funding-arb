@@ -82,6 +82,13 @@ DECISION_FIELDS = [
     "entry_basis_pct",
     "current_basis_pct",
     "basis_improvement_pct",
+    "exit_mode",
+    "expected_next_funding_usd",
+    "pre_funding_exit_profit_usd",
+    "basis_target_reached",
+    "all_in_chunk_profit_usd",
+    "capital_recycle_triggered",
+    "foregone_funding_usd",
 ]
 
 PROCESSED_FIELDS = ["opportunity_key", "timestamp_utc", "source_file", "processed_at_utc"]

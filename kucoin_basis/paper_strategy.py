@@ -261,6 +261,23 @@ def _basis_moved_adversely(position: PaperPosition, config: KucoinBasisConfig) -
     return _basis_improvement_pct(position) < -config.max_basis_adverse_move_pct
 
 
+def _funding_benefit_pct(position: PaperPosition, row: OpportunityRow) -> float | None:
+    if row.funding_rate_pct is None:
+        return None
+    if position.direction == "LONG_SPOT_SHORT_PERP":
+        return row.funding_rate_pct
+    return -row.funding_rate_pct
+
+
+def _basis_target_reason(position: PaperPosition, config: KucoinBasisConfig) -> str | None:
+    basis_improvement = _basis_improvement_pct(position)
+    if basis_improvement >= config.basis_take_profit_improvement_pct:
+        return "basis_converged_take_profit"
+    if basis_improvement >= 0 and abs(position.current_basis_pct) <= config.basis_near_flat_exit_abs_pct:
+        return "basis_near_flat_take_profit"
+    return None
+
+
 def _row_basis_too_volatile(row: OpportunityRow, config: KucoinBasisConfig) -> bool:
     return (
         (
@@ -310,13 +327,7 @@ def _row_age_seconds(row: OpportunityRow, now: datetime) -> float:
 
 def _should_exit(position: PaperPosition, row: OpportunityRow, config: KucoinBasisConfig) -> tuple[bool, str]:
     funding_captured = position.funding_events_captured > 0
-    funding_benefit_pct = None
-    if row.funding_rate_pct is not None:
-        funding_benefit_pct = (
-            row.funding_rate_pct
-            if position.direction == "LONG_SPOT_SHORT_PERP"
-            else -row.funding_rate_pct
-        )
+    funding_benefit_pct = _funding_benefit_pct(position, row)
     next_funding_weak = funding_benefit_pct is not None and funding_benefit_pct < config.min_hold_funding_rate_pct
     basis_improvement = _basis_improvement_pct(position)
     if not funding_captured:
@@ -333,18 +344,16 @@ def _should_exit(position: PaperPosition, row: OpportunityRow, config: KucoinBas
         return True, "funding_weak_basis_adverse_try_unwind"
     if next_funding_weak:
         return True, "funding_captured_next_funding_below_threshold"
+
+    basis_target_reason = _basis_target_reason(position, config)
+    if basis_target_reason is not None:
+        return True, basis_target_reason
+
     if (
         funding_benefit_pct is not None
         and funding_benefit_pct >= config.min_hold_funding_rate_pct
     ):
-        return True, "funding_captured_try_profitable_unwind"
-
-    basis_converged = basis_improvement >= config.basis_take_profit_improvement_pct
-    basis_near_flat = abs(position.current_basis_pct) <= config.basis_near_flat_exit_abs_pct
-    if basis_converged and position.estimated_net_pnl_usd >= 0:
-        return True, "basis_converged_take_profit"
-    if basis_near_flat and position.estimated_net_pnl_usd >= 0:
-        return True, "basis_near_flat_take_profit"
+        return False, "hold_for_next_funding_and_basis"
 
     if row.expected_edge_pct is not None and row.expected_edge_pct < config.min_expected_edge_pct:
         return True, "funding_captured_holding_edge_weak"
@@ -382,6 +391,8 @@ def _choose_partial_close(
     config: KucoinBasisConfig,
     require_profitable: bool = True,
     require_ex_funding_profit: bool = False,
+    min_profit_usd: float = 0.0,
+    max_exit_cost_pct: float | None = None,
 ) -> tuple[float, OpportunityRow, ExitEstimate] | None:
     candidates: list[tuple[float, OpportunityRow, ExitEstimate]] = []
     for chunk in config.gentle_unwind_chunk_ladder_usd:
@@ -398,8 +409,12 @@ def _choose_partial_close(
         estimate = _estimate_exit_chunk(position, row, config, chunk)
         if estimate is None:
             continue
+        if max_exit_cost_pct is not None and _exit_slippage_cost_pct(row, config) > max_exit_cost_pct:
+            continue
         profit_to_test = estimate.net_pnl_ex_funding_usd if require_ex_funding_profit else estimate.net_pnl_usd
         if require_profitable and profit_to_test <= 0:
+            continue
+        if profit_to_test < min_profit_usd:
             continue
         candidates.append((chunk, row, estimate))
     if not candidates:
@@ -416,6 +431,88 @@ def _choose_partial_close(
             -candidate[0],
         ),
     )
+
+
+def _choose_pre_funding_take_profit_close(
+    rows: list[OpportunityRow],
+    *,
+    base: str,
+    direction: str,
+    position: PaperPosition,
+    config: KucoinBasisConfig,
+) -> tuple[float, OpportunityRow, ExitEstimate, float] | None:
+    if not config.pre_funding_take_profit_enabled or position.funding_events_captured > 0:
+        return None
+    if _basis_improvement_pct(position) < config.pre_funding_take_profit_min_basis_improvement_pct:
+        return None
+
+    candidates: list[tuple[float, OpportunityRow, ExitEstimate, float]] = []
+    for chunk in config.gentle_unwind_chunk_ladder_usd:
+        if chunk >= position.notional_usd - 1e-8:
+            continue
+        row = _choose_full_close_row(rows, base=base, direction=direction, notional_usd=chunk)
+        if row is None:
+            continue
+        estimate = _estimate_exit_chunk(position, row, config, chunk)
+        if estimate is None or estimate.net_pnl_ex_funding_usd <= 0:
+            continue
+        funding_benefit_pct = max(0.0, _funding_benefit_pct(position, row) or 0.0)
+        foregone_funding_usd = chunk * funding_benefit_pct / 100
+        profit_hurdle_usd = max(
+            config.pre_funding_take_profit_min_profit_usd,
+            foregone_funding_usd * config.pre_funding_take_profit_funding_multiplier,
+        )
+        if estimate.net_pnl_ex_funding_usd < profit_hurdle_usd:
+            continue
+        candidates.append((chunk, row, estimate, foregone_funding_usd))
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda candidate: (
+            candidate[2].net_pnl_ex_funding_usd,
+            candidate[2].net_pnl_ex_funding_usd / candidate[0],
+            -candidate[0],
+        ),
+    )
+
+
+def _choose_unusually_attractive_close(
+    rows: list[OpportunityRow],
+    *,
+    base: str,
+    direction: str,
+    position: PaperPosition,
+    config: KucoinBasisConfig,
+) -> tuple[float, OpportunityRow, ExitEstimate] | None:
+    chunk = min(config.funding_harvest_unwind_chunk_usd, position.notional_usd)
+    if chunk <= 0:
+        return None
+    row = _choose_full_close_row(rows, base=base, direction=direction, notional_usd=chunk)
+    if row is None:
+        return None
+    estimate = _estimate_exit_chunk(position, row, config, chunk)
+    if estimate is None:
+        return None
+    hurdle_usd = min(
+        config.unusually_attractive_unwind_profit_usd,
+        chunk * config.unusually_attractive_unwind_profit_pct / 100,
+    )
+    if estimate.net_pnl_usd < hurdle_usd:
+        return None
+    return chunk, row, estimate
+
+
+def _capital_recycle_is_preferred(
+    position: PaperPosition,
+    row: OpportunityRow,
+    config: KucoinBasisConfig,
+) -> bool:
+    min_notional = config.max_symbol_notional_usd * config.capital_recycle_min_symbol_exposure_fraction
+    if position.notional_usd < min_notional:
+        return False
+    funding_benefit_pct = _funding_benefit_pct(position, row)
+    return funding_benefit_pct is None or funding_benefit_pct < config.capital_recycle_funding_rate_pct
 
 
 def _choose_funding_harvest_close(
@@ -554,6 +651,56 @@ def run_paper_strategy_once(
             continue
         _mark_position(position, row, config)
         should_exit, reason = _should_exit(position, row, config)
+        selected_exit: tuple[float, OpportunityRow, ExitEstimate] | None = None
+        foregone_funding_usd: float | None = None
+        pre_funding_exit_profit_usd: float | None = None
+        capital_recycle_triggered = False
+
+        if position.funding_events_captured <= 0:
+            pre_funding_exit = _choose_pre_funding_take_profit_close(
+                opportunities,
+                base=position.base,
+                direction=position.direction,
+                position=position,
+                config=config,
+            )
+            if pre_funding_exit is not None:
+                chunk, exit_row, exit_estimate, foregone_funding_usd = pre_funding_exit
+                selected_exit = (chunk, exit_row, exit_estimate)
+                pre_funding_exit_profit_usd = exit_estimate.net_pnl_ex_funding_usd
+                should_exit = True
+                reason = "pre_funding_exceptional_take_profit"
+        elif not should_exit and reason != "hold_for_juicy_next_funding":
+            attractive_exit = _choose_unusually_attractive_close(
+                opportunities,
+                base=position.base,
+                direction=position.direction,
+                position=position,
+                config=config,
+            )
+            if attractive_exit is not None:
+                selected_exit = attractive_exit
+                should_exit = True
+                reason = "unusually_attractive_all_in_unwind"
+            elif _capital_recycle_is_preferred(position, row, config):
+                capital_exit = _choose_partial_close(
+                    opportunities,
+                    base=position.base,
+                    direction=position.direction,
+                    position=position,
+                    position_notional_usd=position.notional_usd,
+                    config=config,
+                    require_profitable=True,
+                    require_ex_funding_profit=False,
+                    min_profit_usd=config.min_funding_harvest_unwind_profit_usd,
+                    max_exit_cost_pct=config.max_entry_exit_cost_pct,
+                )
+                if capital_exit is not None:
+                    selected_exit = capital_exit
+                    should_exit = True
+                    reason = "capital_recycle_profitable_unwind"
+                    capital_recycle_triggered = True
+
         if reason == "hold_basis_moved_adversely":
             _ensure_cooldown(
                 store,
@@ -563,6 +710,47 @@ def run_paper_strategy_once(
                 reason=reason,
                 config=config,
             )
+        funding_benefit_pct = _funding_benefit_pct(position, row)
+        expected_next_funding_usd = (
+            position.notional_usd * funding_benefit_pct / 100
+            if funding_benefit_pct is not None
+            else None
+        )
+        basis_target_reached = _basis_target_reason(position, config) is not None
+        all_in_chunk_profit_usd = selected_exit[2].net_pnl_usd if selected_exit is not None else None
+        if reason == "pre_funding_exceptional_take_profit":
+            exit_mode = "pre_funding_take_profit"
+        elif reason in {
+            "funding_captured_next_funding_below_threshold",
+            "funding_weak_basis_adverse_try_unwind",
+            "funding_captured_holding_edge_weak",
+        }:
+            exit_mode = "weak_funding"
+        elif reason in {"basis_converged_take_profit", "basis_near_flat_take_profit"}:
+            exit_mode = "basis_target"
+        elif reason == "unusually_attractive_all_in_unwind":
+            exit_mode = "attractive_all_in"
+        elif reason == "capital_recycle_profitable_unwind":
+            exit_mode = "capital_recycle"
+        else:
+            exit_mode = "hold"
+        exit_audit_fields = {
+            "exit_mode": exit_mode,
+            "expected_next_funding_usd": (
+                "" if expected_next_funding_usd is None else f"{expected_next_funding_usd:.8f}"
+            ),
+            "pre_funding_exit_profit_usd": (
+                "" if pre_funding_exit_profit_usd is None else f"{pre_funding_exit_profit_usd:.8f}"
+            ),
+            "basis_target_reached": str(basis_target_reached),
+            "all_in_chunk_profit_usd": (
+                "" if all_in_chunk_profit_usd is None else f"{all_in_chunk_profit_usd:.8f}"
+            ),
+            "capital_recycle_triggered": str(capital_recycle_triggered),
+            "foregone_funding_usd": (
+                "" if foregone_funding_usd is None else f"{foregone_funding_usd:.8f}"
+            ),
+        }
         decision_now = utc_now()
         store.append_decision(
             {
@@ -582,13 +770,15 @@ def run_paper_strategy_once(
                 "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
                 "current_basis_pct": f"{position.current_basis_pct:.8f}",
                 "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
+                **exit_audit_fields,
             }
         )
         if should_exit:
             exit_chunk = None
             exit_row = row
             exit_estimate = None
-            force_gentle_unwind = reason == "funding_captured_try_profitable_unwind"
+            if selected_exit is not None:
+                exit_chunk, exit_row, exit_estimate = selected_exit
             full_exit_estimate = None
             full_exit_min_profit_usd = (
                 position.notional_usd * config.min_profit_to_full_exit_pct / 100
@@ -597,7 +787,7 @@ def run_paper_strategy_once(
             )
             full_exit = False
             if (
-                not force_gentle_unwind
+                selected_exit is None
                 and row.notional_usd + 1e-8 >= position.notional_usd
                 and row.spot_exit_avg_price is not None
                 and row.perp_exit_avg_price is not None
@@ -607,10 +797,10 @@ def run_paper_strategy_once(
                     full_exit_estimate is not None
                     and full_exit_estimate.net_pnl_ex_funding_usd >= full_exit_min_profit_usd
                 )
-            if full_exit:
+            if selected_exit is None and full_exit:
                 exit_chunk = position.notional_usd
                 exit_estimate = full_exit_estimate
-            elif config.gentle_unwind_enabled:
+            elif selected_exit is None and config.gentle_unwind_enabled:
                 partial = _choose_partial_close(
                     opportunities,
                     base=position.base,
@@ -627,6 +817,8 @@ def run_paper_strategy_once(
                     "funding_captured_next_funding_below_threshold",
                     "funding_weak_basis_adverse_try_unwind",
                     "funding_captured_holding_edge_weak",
+                    "basis_converged_take_profit",
+                    "basis_near_flat_take_profit",
                 }:
                     harvest = _choose_funding_harvest_close(
                         opportunities,
@@ -658,6 +850,7 @@ def run_paper_strategy_once(
                         "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
                         "current_basis_pct": f"{position.current_basis_pct:.8f}",
                         "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
+                        **exit_audit_fields,
                     }
                 )
                 continue

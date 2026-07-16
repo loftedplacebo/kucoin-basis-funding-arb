@@ -20,7 +20,13 @@ from core.symbols import normalise_symbol, split_standard_symbol
 from kucoin_basis.config import DEFAULT_CONFIG, KucoinBasisConfig
 from kucoin_basis.kucoin_public_client import KucoinPublicClient
 from kucoin_basis.models import OpportunityRow, parse_datetime, parse_float
-from kucoin_basis.paper_strategy import _estimate_exit_chunk
+from kucoin_basis.paper_strategy import (
+    _basis_improvement_pct,
+    _basis_target_reason,
+    _estimate_exit_chunk,
+    _exit_slippage_cost_pct,
+    _funding_benefit_pct as _position_funding_benefit_pct,
+)
 from kucoin_basis.paper_store import PaperStore
 
 
@@ -539,6 +545,14 @@ HTML = """<!doctype html>
         full_position_close_liquidity_missing: "close liquidity missing",
         hold_basis_moved_adversely: "hold: basis adverse",
         hold_for_next_profitable_funding: "hold: funding good",
+        hold_for_next_funding_and_basis: "hold: funding/basis",
+        hold_for_juicy_next_funding: "hold: funding juicy",
+        pre_funding_exceptional_take_profit: "pre-funding take-profit",
+        basis_converged_take_profit: "basis target reached",
+        basis_near_flat_take_profit: "basis near flat",
+        unusually_attractive_all_in_unwind: "strong all-in unwind",
+        capital_recycle_profitable_unwind: "capital recycle",
+        funding_harvest_profitable_unwind: "funding harvest",
         funding_captured_next_funding_below_threshold: "next funding weak",
         funding_weak_basis_adverse_try_unwind: "weak funding: try unwind",
         exit_wanted_no_profitable_chunk: "exit wanted: no good chunk",
@@ -1119,12 +1133,61 @@ def _position_unwind_estimates(position, rows: list[OpportunityRow], config: Kuc
     if estimate is None:
         return result
 
-    if estimate.net_pnl_ex_funding_usd >= 0:
-        status = "basis profitable"
-    elif estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd:
-        status = "funding harvest"
+    funding_benefit_pct = _position_funding_benefit_pct(position, row)
+    basis_target_reached = _basis_target_reason(position, config) is not None
+    unusually_attractive_hurdle = min(
+        config.unusually_attractive_unwind_profit_usd,
+        chunk * config.unusually_attractive_unwind_profit_pct / 100,
+    )
+    capital_recycle_threshold = (
+        config.max_symbol_notional_usd
+        * config.capital_recycle_min_symbol_exposure_fraction
+    )
+    capital_recycle_ready = (
+        position.notional_usd >= capital_recycle_threshold
+        and (
+            funding_benefit_pct is None
+            or funding_benefit_pct < config.capital_recycle_funding_rate_pct
+        )
+        and estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd
+        and _exit_slippage_cost_pct(row, config) <= config.max_entry_exit_cost_pct
+    )
+
+    if position.funding_events_captured <= 0:
+        foregone_funding_usd = chunk * max(0.0, funding_benefit_pct or 0.0) / 100
+        pre_funding_hurdle = max(
+            config.pre_funding_take_profit_min_profit_usd,
+            foregone_funding_usd * config.pre_funding_take_profit_funding_multiplier,
+        )
+        if (
+            config.pre_funding_take_profit_enabled
+            and chunk < position.notional_usd - 1e-8
+            and _basis_improvement_pct(position)
+            >= config.pre_funding_take_profit_min_basis_improvement_pct
+            and estimate.net_pnl_ex_funding_usd >= pre_funding_hurdle
+        ):
+            status = "pre-funding TP ready"
+        else:
+            status = "hold to funding"
+    elif funding_benefit_pct is not None and funding_benefit_pct >= config.juicy_hold_funding_rate_pct:
+        status = "hold: juicy funding"
+    elif funding_benefit_pct is not None and funding_benefit_pct < config.min_hold_funding_rate_pct:
+        if estimate.net_pnl_ex_funding_usd >= 0:
+            status = "weak funding: unwind"
+        elif estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd:
+            status = "weak funding: harvest"
+        else:
+            status = "hold"
+    elif basis_target_reached and estimate.net_pnl_ex_funding_usd >= 0:
+        status = "basis target: unwind"
+    elif basis_target_reached and estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd:
+        status = "basis target: harvest"
+    elif estimate.net_pnl_usd >= unusually_attractive_hurdle:
+        status = "strong all-in unwind"
+    elif capital_recycle_ready:
+        status = "capital recycle"
     else:
-        status = "hold"
+        status = "hold for funding/basis"
 
     result.update({
         "next_unwind_chunk_usd": f"{chunk:.8f}",

@@ -48,6 +48,14 @@ class KucoinBasisConfig:
     gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
     funding_harvest_unwind_chunk_usd: float = 100.0
     min_funding_harvest_unwind_profit_usd: float = 0.25
+    pre_funding_take_profit_enabled: bool = True
+    pre_funding_take_profit_min_basis_improvement_pct: float = 2.00
+    pre_funding_take_profit_min_profit_usd: float = 5.00
+    pre_funding_take_profit_funding_multiplier: float = 1.25
+    unusually_attractive_unwind_profit_usd: float = 1.00
+    unusually_attractive_unwind_profit_pct: float = 0.75
+    capital_recycle_funding_rate_pct: float = 0.50
+    capital_recycle_min_symbol_exposure_fraction: float = 0.80
     min_profit_to_full_exit_pct: float = 0.02
     juicy_hold_funding_rate_pct: float = 1.00
     post_close_reentry_cooldown_minutes: float = 60.0

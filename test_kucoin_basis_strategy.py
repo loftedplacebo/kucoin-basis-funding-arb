@@ -6,10 +6,10 @@ from datetime import datetime, timedelta, timezone
 from core.models import OrderBook, OrderBookLevel
 from kucoin_basis.config import KucoinBasisConfig
 from kucoin_basis.models import OpportunityRow, SymbolPair, parse_float
-from kucoin_basis.funding_dashboard import load_summary_payload
+from kucoin_basis.funding_dashboard import _position_unwind_estimates, load_summary_payload
 from kucoin_basis.opportunity_scanner import scan_pair
 from kucoin_basis.paper_models import PaperPosition
-from kucoin_basis.paper_store import PaperStore
+from kucoin_basis.paper_store import DECISION_FIELDS, PaperStore
 from kucoin_basis.paper_strategy import _accrue_funding_if_crossed, _choose_partial_close, _should_exit, run_paper_strategy_once
 
 
@@ -278,7 +278,7 @@ def test_very_juicy_next_funding_overrides_basis_take_profit():
     assert reason == "hold_for_juicy_next_funding"
 
 
-def test_profitable_next_funding_still_tries_gentle_unwind_after_funding():
+def test_profitable_next_funding_holds_until_an_exit_trigger_after_funding():
     config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30, juicy_hold_funding_rate_pct=1.0)
     position = make_position(
         entry_basis_pct=-5.0,
@@ -290,8 +290,294 @@ def test_profitable_next_funding_still_tries_gentle_unwind_after_funding():
 
     should_exit, reason = _should_exit(position, row, config)
 
-    assert should_exit is True
-    assert reason == "funding_captured_try_profitable_unwind"
+    assert should_exit is False
+    assert reason == "hold_for_next_funding_and_basis"
+
+
+def test_exceptional_pre_funding_profit_takes_best_partial_chunk():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=1_000.0,
+            spot_qty=10.0,
+            perp_qty=10.0,
+            entry_basis_pct=-3.0,
+            current_basis_pct=-3.0,
+            funding_events_captured=0,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            basis_pct=-0.5,
+            spot_ask=99.0,
+            perp_bid=101.0,
+            spot_exit_avg_price=99.0,
+            perp_exit_avg_price=101.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        positions = store.load_open_positions()
+        assert positions[position.position_id].notional_usd == 500.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        assert fills[-1]["event_type"] == "PARTIAL_CLOSE"
+        assert parse_float(fills[-1]["notional_usd"]) == 500.0
+        assert fills[-1]["reason"] == "pre_funding_exceptional_take_profit"
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decision = [item for item in decisions if item["decision_type"] == "EXIT"][-1]
+        assert exit_decision["exit_mode"] == "pre_funding_take_profit"
+        assert (parse_float(exit_decision["pre_funding_exit_profit_usd"], 0.0) or 0.0) >= 5.0
+        assert (parse_float(exit_decision["foregone_funding_usd"], 0.0) or 0.0) > 0
+
+
+def test_pre_funding_profit_still_holds_below_basis_improvement_threshold():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=1_000.0,
+            spot_qty=10.0,
+            perp_qty=10.0,
+            entry_basis_pct=-3.0,
+            current_basis_pct=-3.0,
+            funding_events_captured=0,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            basis_pct=-1.1,
+            spot_ask=99.0,
+            perp_bid=101.0,
+            spot_exit_avg_price=99.0,
+            perp_exit_avg_price=101.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 1_000.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decisions = [item for item in decisions if item["decision_type"] == "EXIT"]
+        assert exit_decisions[-1]["reason"] == "hold_until_first_funding"
+
+
+def test_pre_funding_profit_must_beat_foregone_funding_hurdle():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=1_000.0,
+            spot_qty=10.0,
+            perp_qty=10.0,
+            entry_basis_pct=-3.0,
+            current_basis_pct=-3.0,
+            funding_events_captured=0,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-5.0,
+            basis_pct=-0.5,
+            spot_ask=99.0,
+            perp_bid=101.0,
+            spot_exit_avg_price=99.0,
+            perp_exit_avg_price=101.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 1_000.0
+        assert not store.fills_path.exists()
+
+
+def test_moderate_funding_holds_when_no_post_funding_exit_trigger_is_met():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(realised_funding_pnl_usd=0.0, funding_events_captured=1)
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.5,
+            basis_pct=-0.8,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 500.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decisions = [item for item in decisions if item["decision_type"] == "EXIT"]
+        assert exit_decisions[-1]["reason"] == "hold_for_next_funding_and_basis"
+
+
+def test_unusually_attractive_all_in_chunk_can_unwind_with_moderate_funding():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(realised_funding_pnl_usd=4.0, funding_events_captured=1)
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.5,
+            basis_pct=-0.8,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        assert fills[-1]["reason"] == "unusually_attractive_all_in_unwind"
+        assert (parse_float(fills[-1]["realised_funding_pnl_usd"], 0.0) or 0.0) == 0.8
+
+
+def test_large_position_can_recycle_profitable_chunk_when_funding_is_only_moderate():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=4_000.0,
+            spot_qty=40.0,
+            perp_qty=40.0,
+            realised_funding_pnl_usd=20.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.4,
+            basis_pct=-0.8,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 3_900.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        assert fills[-1]["reason"] == "capital_recycle_profitable_unwind"
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decisions = [item for item in decisions if item["decision_type"] == "EXIT"]
+        assert exit_decisions[-1]["capital_recycle_triggered"] == "True"
+
+
+def test_capital_recycle_rejects_excessive_exit_cost():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=4_000.0,
+            spot_qty=40.0,
+            perp_qty=40.0,
+            realised_funding_pnl_usd=52.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.5, 0.5),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.4,
+            basis_pct=-0.8,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 4_000.0
+        assert not store.fills_path.exists()
+
+
+def test_juicy_funding_blocks_even_an_unusually_attractive_exit():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(realised_funding_pnl_usd=50.0, funding_events_captured=1)
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-1.2,
+            basis_pct=-0.2,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 500.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decisions = [item for item in decisions if item["decision_type"] == "EXIT"]
+        assert exit_decisions[-1]["reason"] == "hold_for_juicy_next_funding"
+
+
+def test_dashboard_unwind_status_matches_moderate_funding_triggers():
+    config = KucoinBasisConfig()
+    row = replace_row(make_row(100.0, 0.01, 0.01), funding_rate_pct=-0.5, basis_pct=-0.8)
+
+    holding = _position_unwind_estimates(
+        make_position(realised_funding_pnl_usd=0.0, funding_events_captured=1),
+        [row],
+        config,
+    )
+    attractive = _position_unwind_estimates(
+        make_position(realised_funding_pnl_usd=4.0, funding_events_captured=1),
+        [row],
+        config,
+    )
+
+    assert holding["next_unwind_status"] == "hold for funding/basis"
+    assert attractive["next_unwind_status"] == "strong all-in unwind"
 
 
 def test_profitable_post_funding_unwind_closes_best_chunk_only():
@@ -308,12 +594,14 @@ def test_profitable_post_funding_unwind_closes_best_chunk_only():
         small = replace_row(
             make_row(100.0, 0.01, 0.01),
             timestamp_utc=now - timedelta(seconds=30),
+            basis_pct=-0.3,
             decision="REJECT",
             reason="open_position_watchlist",
         )
         large = replace_row(
             make_row(500.0, 0.05, 0.05),
             timestamp_utc=now - timedelta(seconds=30),
+            basis_pct=-0.3,
             decision="REJECT",
             reason="open_position_watchlist",
         )
@@ -328,7 +616,7 @@ def test_profitable_post_funding_unwind_closes_best_chunk_only():
             fills = list(csv.DictReader(f))
         assert fills[-1]["event_type"] == "PARTIAL_CLOSE"
         assert parse_float(fills[-1]["notional_usd"]) == 100.0
-        assert fills[-1]["reason"] == "funding_captured_try_profitable_unwind"
+        assert fills[-1]["reason"] == "basis_converged_take_profit"
         assert parse_float(fills[-1]["realised_basis_pnl_usd"]) > 0
         assert parse_float(fills[-1]["realised_funding_pnl_usd"]) == 1.0
         assert 0 < parse_float(fills[-1]["realised_pnl_usd"]) < parse_float(fills[-1]["realised_funding_pnl_usd"])
@@ -349,6 +637,7 @@ def test_post_close_cooldown_blocks_same_loop_reentry():
         row = replace_row(
             make_row(100.0, 0.01, 0.01),
             timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.1,
             decision="ENTER_CANDIDATE",
             reason="entry_rules_passed",
         )
@@ -442,6 +731,47 @@ def test_weak_funding_exit_harvests_profitable_100_usd_chunk_all_in():
         assert exit_decisions[-1]["reason"] == "funding_captured_next_funding_below_threshold"
 
 
+def test_basis_target_can_harvest_funding_when_trade_pnl_is_still_negative():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=500.0,
+            realised_funding_pnl_usd=50.0,
+            funding_events_captured=1,
+            spot_qty=5.0,
+            perp_qty=5.0,
+            entry_basis_pct=-1.0,
+            current_basis_pct=-1.0,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        lossy_row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.5,
+            basis_pct=-0.3,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [lossy_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        positions = store.load_open_positions()
+        assert positions[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        assert fills[-1]["reason"] == "funding_harvest_profitable_unwind"
+        assert (parse_float(fills[-1]["realised_pnl_usd"], 0.0) or 0.0) < 0
+        assert (parse_float(fills[-1]["realised_funding_pnl_usd"], 0.0) or 0.0) == 10.0
+
+
 def test_weak_funding_exit_still_holds_when_harvest_chunk_not_profitable_all_in():
     with TemporaryDirectory() as tmp:
         config = make_config(Path(tmp))
@@ -533,6 +863,42 @@ def test_summary_totals_do_not_double_count_open_funding():
         assert payload["estimatedOpenPnlExFundingUsd"] == -4.0
         assert payload["totalRealisedPnlUsd"] == 3.0
         assert payload["totalPnlInclOpenUsd"] == -1.0
+
+
+def test_decision_schema_upgrade_preserves_legacy_rows():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        store.data_dir.mkdir(parents=True, exist_ok=True)
+        legacy_fields = DECISION_FIELDS[:16]
+        with store.decisions_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=legacy_fields)
+            writer.writeheader()
+            writer.writerow({
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "decision_type": "EXIT",
+                "base": "MIRA",
+                "direction": "SHORT_SPOT_LONG_PERP",
+                "reason": "legacy_reason",
+            })
+
+        store.append_decision({
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "decision_type": "EXIT",
+            "base": "MIRA",
+            "direction": "SHORT_SPOT_LONG_PERP",
+            "reason": "new_reason",
+            "exit_mode": "basis_target",
+            "basis_target_reached": "True",
+        })
+
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+            assert reader.fieldnames == DECISION_FIELDS
+        assert [row["reason"] for row in rows] == ["legacy_reason", "new_reason"]
+        assert rows[0]["exit_mode"] == ""
+        assert rows[1]["exit_mode"] == "basis_target"
 
 
 def test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist():
@@ -666,13 +1032,24 @@ if __name__ == "__main__":
     test_stale_close_row_is_not_used_for_exit_decision()
     test_adverse_basis_holds_instead_of_hard_exit()
     test_very_juicy_next_funding_overrides_basis_take_profit()
-    test_profitable_next_funding_still_tries_gentle_unwind_after_funding()
+    test_profitable_next_funding_holds_until_an_exit_trigger_after_funding()
+    test_exceptional_pre_funding_profit_takes_best_partial_chunk()
+    test_pre_funding_profit_still_holds_below_basis_improvement_threshold()
+    test_pre_funding_profit_must_beat_foregone_funding_hurdle()
+    test_moderate_funding_holds_when_no_post_funding_exit_trigger_is_met()
+    test_unusually_attractive_all_in_chunk_can_unwind_with_moderate_funding()
+    test_large_position_can_recycle_profitable_chunk_when_funding_is_only_moderate()
+    test_capital_recycle_rejects_excessive_exit_cost()
+    test_juicy_funding_blocks_even_an_unusually_attractive_exit()
+    test_dashboard_unwind_status_matches_moderate_funding_triggers()
     test_profitable_post_funding_unwind_closes_best_chunk_only()
     test_post_close_cooldown_blocks_same_loop_reentry()
     test_profitable_carry_unwind_requires_profit_excluding_funding()
     test_weak_funding_exit_harvests_profitable_100_usd_chunk_all_in()
+    test_basis_target_can_harvest_funding_when_trade_pnl_is_still_negative()
     test_weak_funding_exit_still_holds_when_harvest_chunk_not_profitable_all_in()
     test_summary_totals_do_not_double_count_open_funding()
+    test_decision_schema_upgrade_preserves_legacy_rows()
     test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist()
     test_adverse_basis_with_weak_funding_tries_profitable_unwind()
     test_adverse_basis_existing_position_blocks_add()
