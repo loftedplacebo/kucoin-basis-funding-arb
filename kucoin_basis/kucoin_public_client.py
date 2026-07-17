@@ -77,3 +77,23 @@ class KucoinPublicClient:
         except Exception:
             data = self._get(FUTURES_BASE_URL, f"/api/v1/funding-rate/{exchange_symbol}/current")
             return data if isinstance(data, dict) else {}
+
+    def get_public_funding_history(
+        self,
+        exchange_symbol: str,
+        from_ms: int,
+        to_ms: int,
+    ) -> list[dict]:
+        data = self._get(
+            FUTURES_BASE_URL,
+            "/api/v1/contract/funding-rates",
+            params={"symbol": exchange_symbol, "from": from_ms, "to": to_ms},
+        )
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("dataList", "items"):
+                rows = data.get(key)
+                if isinstance(rows, list):
+                    return rows
+        return []

@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from core.models import OrderBook, OrderBookLevel
 from kucoin_basis.config import KucoinBasisConfig
+from kucoin_basis.funding import fetch_funding_snapshot
 from kucoin_basis.models import OpportunityRow, SymbolPair, parse_float
 from kucoin_basis.funding_dashboard import (
     HTML,
@@ -12,7 +13,12 @@ from kucoin_basis.funding_dashboard import (
     load_positions_payload,
     load_summary_payload,
 )
-from kucoin_basis.opportunity_scanner import scan_pair
+from kucoin_basis.opportunity_scanner import (
+    _FUNDING_CYCLE_OBSERVATIONS,
+    _decision_for_row,
+    _funding_cycle_confirmed,
+    scan_pair,
+)
 from kucoin_basis.paper_models import PaperPosition
 from kucoin_basis.paper_store import DECISION_FIELDS, PaperStore
 from kucoin_basis.paper_strategy import _accrue_funding_if_crossed, _choose_partial_close, _should_exit, run_paper_strategy_once
@@ -106,6 +112,12 @@ def replace_row(row: OpportunityRow, **overrides) -> OpportunityRow:
 
 
 class DummyKucoinClient:
+    def get_current_funding_rate(self, exchange_symbol: str) -> dict:
+        return {
+            "nextFundingRate": "0.001",
+            "fundingTime": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp() * 1000),
+        }
+
     def get_spot_orderbook(self, standard_symbol: str, exchange_symbol: str, limit: int = 100) -> OrderBook:
         now = datetime.now(timezone.utc)
         return OrderBook(
@@ -129,6 +141,49 @@ class DummyKucoinClient:
             asks=[OrderBookLevel(100.2, 1000.0)],
             observed_at_utc=now,
         )
+
+
+class DummyFundingHistoryClient:
+    def __init__(self, settlements: dict[datetime, float]):
+        self.settlements = settlements
+
+    def get_public_funding_history(
+        self,
+        exchange_symbol: str,
+        from_ms: int,
+        to_ms: int,
+    ) -> list[dict]:
+        return [
+            {
+                "symbol": exchange_symbol,
+                "fundingRate": str(rate_pct / 100),
+                "timepoint": int(funding_time.timestamp() * 1000),
+            }
+            for funding_time, rate_pct in self.settlements.items()
+            if from_ms <= int(funding_time.timestamp() * 1000) <= to_ms
+        ]
+
+
+class FixedCurrentFundingClient:
+    def __init__(self, rate: float, funding_time: datetime):
+        self.rate = rate
+        self.funding_time = funding_time
+
+    def get_current_funding_rate(self, exchange_symbol: str) -> dict:
+        return {
+            "nextFundingRate": str(self.rate),
+            "fundingTime": int(self.funding_time.timestamp() * 1000),
+        }
+
+
+class FailingFundingHistoryClient:
+    def get_public_funding_history(
+        self,
+        exchange_symbol: str,
+        from_ms: int,
+        to_ms: int,
+    ) -> list[dict]:
+        raise RuntimeError("temporary history outage")
 
 
 def test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage():
@@ -160,13 +215,18 @@ def test_funding_accrues_without_current_opportunity_row():
     with TemporaryDirectory() as tmp:
         config = make_config(Path(tmp))
         store = PaperStore(config)
+        first_funding_time = (datetime.now(timezone.utc) - timedelta(minutes=90)).replace(microsecond=0)
+        second_funding_time = first_funding_time + timedelta(hours=1)
         position = make_position(
-            next_funding_time=datetime.now(timezone.utc) - timedelta(minutes=90),
+            next_funding_time=first_funding_time,
             funding_interval_hours=1.0,
             funding_events_captured=0,
         )
 
-        _accrue_funding_if_crossed(position, None, store, config)
+        history_client = DummyFundingHistoryClient(
+            {first_funding_time: -0.5, second_funding_time: -0.5}
+        )
+        _accrue_funding_if_crossed(position, None, store, config, history_client)
 
         assert position.funding_events_captured == 2
         assert position.next_funding_time is not None
@@ -175,6 +235,125 @@ def test_funding_accrues_without_current_opportunity_row():
             events = list(csv.DictReader(f))
         assert len(events) == 2
         assert sum(parse_float(row["funding_pnl_usd"], 0.0) or 0.0 for row in events) == 5.0
+
+
+def test_funding_snapshot_uses_atomic_current_response_not_stale_contract_rate():
+    funding_time = datetime(2026, 7, 13, 0, 0, tzinfo=timezone.utc)
+    client = FixedCurrentFundingClient(rate=-0.001557, funding_time=funding_time)
+    pair = SymbolPair(base="GTC", spot_symbol="GTC-USDT", perp_symbol="GTCUSDTM")
+    contracts = {
+        "GTCUSDTM": {
+            "fundingFeeRate": "0.003782",
+            "nextFundingRateDateTime": int(funding_time.timestamp() * 1000),
+            "currentFundingRateGranularity": 8 * 60 * 60 * 1000,
+        }
+    }
+
+    snapshot = fetch_funding_snapshot(client, pair, contracts)
+
+    assert snapshot.funding_rate_pct == -0.1557
+    assert snapshot.funding_time_utc == funding_time
+    assert snapshot.funding_interval_hours == 8.0
+
+
+def test_post_funding_rollover_quarantine_blocks_entry():
+    config = KucoinBasisConfig(post_funding_entry_quarantine_minutes=5.0)
+    decision, reason = _decision_for_row(
+        pair=SymbolPair(base="GTC", spot_symbol="GTC-USDT", perp_symbol="GTCUSDTM"),
+        config=config,
+        direction="LONG_SPOT_SHORT_PERP",
+        funding_benefit_pct=0.50,
+        minutes_to_funding=(8 * 60) - (26 / 60),
+        funding_interval_hours=8.0,
+        funding_cycle_confirmed=True,
+        expected_edge_pct=0.10,
+        round_trip_fillable=True,
+        basis_observation_count=0,
+        basis_percentile=None,
+        exit_cost_pct=0.10,
+    )
+
+    assert decision == "REJECT"
+    assert reason == "post_funding_rollover_quarantine"
+
+
+def test_new_funding_cycle_requires_two_observations():
+    _FUNDING_CYCLE_OBSERVATIONS.clear()
+    funding_time = datetime(2026, 7, 13, 0, 0, tzinfo=timezone.utc)
+
+    assert _funding_cycle_confirmed("GTCUSDTM", funding_time, 2) is False
+    assert _funding_cycle_confirmed("GTCUSDTM", funding_time, 2) is True
+    assert _funding_cycle_confirmed("GTCUSDTM", funding_time + timedelta(hours=8), 2) is False
+
+
+def test_funding_accrual_uses_exact_settlement_not_current_cycle_rate():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        funding_time = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0)
+        position = make_position(
+            next_funding_time=funding_time,
+            funding_interval_hours=8.0,
+            funding_events_captured=0,
+        )
+        current_row = replace_row(make_row(100.0, 0.01, 0.01), funding_rate_pct=0.9)
+        history_client = DummyFundingHistoryClient({funding_time: -0.5})
+
+        _accrue_funding_if_crossed(position, current_row, store, config, history_client)
+
+        assert position.funding_events_captured == 1
+        assert position.realised_funding_pnl_usd == 2.5
+        with store.funding_events_path.open("r", newline="", encoding="utf-8") as f:
+            event = next(csv.DictReader(f))
+        assert parse_float(event["funding_rate_pct"]) == -0.5
+
+
+def test_missing_settlement_history_keeps_funding_pending_for_retry():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        funding_time = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0)
+        position = make_position(
+            next_funding_time=funding_time,
+            funding_interval_hours=8.0,
+            funding_events_captured=0,
+        )
+
+        _accrue_funding_if_crossed(
+            position,
+            make_row(100.0, 0.01, 0.01),
+            store,
+            config,
+            DummyFundingHistoryClient({}),
+        )
+
+        assert position.funding_events_captured == 0
+        assert position.next_funding_time == funding_time
+        assert not store.funding_events_path.exists()
+
+
+def test_funding_history_failure_keeps_funding_pending_for_retry():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        funding_time = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=0)
+        position = make_position(
+            next_funding_time=funding_time,
+            funding_interval_hours=8.0,
+            funding_events_captured=0,
+        )
+
+        _accrue_funding_if_crossed(
+            position,
+            make_row(100.0, 0.01, 0.01),
+            store,
+            config,
+            FailingFundingHistoryClient(),
+        )
+
+        assert position.funding_events_captured == 0
+        assert position.next_funding_time == funding_time
+        assert not store.funding_events_path.exists()
 
 
 def test_add_position_fill_logs_added_chunk_not_running_total():
@@ -1068,6 +1247,12 @@ def test_volatility_cooldown_blocks_reentry_for_60_minutes():
 if __name__ == "__main__":
     test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage()
     test_funding_accrues_without_current_opportunity_row()
+    test_funding_snapshot_uses_atomic_current_response_not_stale_contract_rate()
+    test_post_funding_rollover_quarantine_blocks_entry()
+    test_new_funding_cycle_requires_two_observations()
+    test_funding_accrual_uses_exact_settlement_not_current_cycle_rate()
+    test_missing_settlement_history_keeps_funding_pending_for_retry()
+    test_funding_history_failure_keeps_funding_pending_for_retry()
     test_add_position_fill_logs_added_chunk_not_running_total()
     test_stale_close_row_is_not_used_for_exit_decision()
     test_adverse_basis_holds_instead_of_hard_exit()

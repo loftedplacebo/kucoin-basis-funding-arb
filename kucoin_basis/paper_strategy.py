@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from kucoin_basis.config import DEFAULT_CONFIG, KucoinBasisConfig
+from kucoin_basis.funding import fetch_funding_settlements
+from kucoin_basis.kucoin_public_client import KucoinPublicClient
 from kucoin_basis.models import OpportunityRow, format_datetime, parse_datetime, utc_now
 from kucoin_basis.paper_models import PaperPosition
 from kucoin_basis.paper_store import PaperStore
@@ -195,17 +197,12 @@ def _funding_interval_hours(
     return interval if interval > 0 else config.fallback_funding_interval_hours
 
 
-def _raw_funding_rate_pct(position: PaperPosition, row: OpportunityRow | None) -> float:
-    if row is not None and row.funding_rate_pct is not None:
-        return row.funding_rate_pct
-    return position.funding_rate_pct_at_entry
-
-
 def _accrue_funding_if_crossed(
     position: PaperPosition,
     row: OpportunityRow | None,
     store: PaperStore,
     config: KucoinBasisConfig,
+    funding_client: KucoinPublicClient | None = None,
 ) -> None:
     now = utc_now()
     funding_time = position.next_funding_time
@@ -213,8 +210,28 @@ def _accrue_funding_if_crossed(
         return
     if row is not None and row.funding_interval is not None:
         position.funding_interval_hours = row.funding_interval
-    raw_funding_rate_pct = _raw_funding_rate_pct(position, row)
+    if funding_client is None:
+        return
+    try:
+        settlements = fetch_funding_settlements(
+            funding_client,
+            position.perp_symbol,
+            funding_time,
+            now,
+        )
+    except Exception as error:
+        print(
+            f"Funding settlement pending for {position.perp_symbol} at "
+            f"{format_datetime(funding_time)}: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        return
     while funding_time is not None and funding_time <= now:
+        raw_funding_rate_pct = settlements.get(funding_time)
+        if raw_funding_rate_pct is None:
+            # KuCoin can publish the final settlement shortly after the boundary.
+            # Keep it pending and retry instead of applying the next cycle's rate.
+            break
         funding_benefit_pct = (
             raw_funding_rate_pct
             if position.direction == "LONG_SPOT_SHORT_PERP"
@@ -603,6 +620,7 @@ def _add_to_position(position: PaperPosition, row: OpportunityRow) -> PaperPosit
 def run_paper_strategy_once(
     config: KucoinBasisConfig = DEFAULT_CONFIG,
     opportunity_path: Path | None = None,
+    funding_client: KucoinPublicClient | None = None,
 ) -> dict:
     store = PaperStore(config)
     now = utc_now()
@@ -614,6 +632,7 @@ def run_paper_strategy_once(
     active_cooldowns = store.load_active_cooldowns(now)
     _repair_missing_next_funding_times(positions, store, config)
     by_base = _open_notional_by_base(positions)
+    funding_client = funding_client or KucoinPublicClient()
 
     latest_by_position = {}
     for row in opportunities:
@@ -626,7 +645,7 @@ def run_paper_strategy_once(
             direction=position.direction,
             notional_usd=position.notional_usd,
         ) or latest_by_position.get((position.base, position.direction))
-        _accrue_funding_if_crossed(position, row, store, config)
+        _accrue_funding_if_crossed(position, row, store, config, funding_client)
         if row is None:
             store.append_decision(
                 {

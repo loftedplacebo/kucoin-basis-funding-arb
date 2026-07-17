@@ -16,6 +16,8 @@ class KucoinBasisConfig:
     min_hold_funding_rate_pct: float = 0.30
     min_expected_edge_pct: float = 0.02
     min_minutes_before_funding: float = 15.0
+    post_funding_entry_quarantine_minutes: float = 5.0
+    funding_cycle_confirmation_observations: int = 2
     orderbook_monitor_interval_seconds: float = 60.0
     max_strategy_row_age_seconds: float = 180.0
     volatility_cooldown_minutes: float = 60.0

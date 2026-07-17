@@ -58,6 +58,22 @@ OPPORTUNITY_FIELDS = [
 ]
 
 
+_FUNDING_CYCLE_OBSERVATIONS: dict[str, tuple[datetime, int]] = {}
+
+
+def _funding_cycle_confirmed(
+    perp_symbol: str,
+    funding_time_utc: datetime | None,
+    required_observations: int,
+) -> bool:
+    if funding_time_utc is None:
+        return False
+    previous = _FUNDING_CYCLE_OBSERVATIONS.get(perp_symbol)
+    count = previous[1] + 1 if previous and previous[0] == funding_time_utc else 1
+    _FUNDING_CYCLE_OBSERVATIONS[perp_symbol] = (funding_time_utc, count)
+    return count >= max(1, required_observations)
+
+
 def opportunity_file(config: KucoinBasisConfig, now: datetime | None = None) -> Path:
     now = now or utc_now()
     config.opportunities_dir.mkdir(parents=True, exist_ok=True)
@@ -99,6 +115,8 @@ def _decision_for_row(
     direction: str,
     funding_benefit_pct: float | None,
     minutes_to_funding: float | None,
+    funding_interval_hours: float | None,
+    funding_cycle_confirmed: bool,
     expected_edge_pct: float | None,
     round_trip_fillable: bool,
     basis_observation_count: int,
@@ -115,6 +133,14 @@ def _decision_for_row(
         return "REJECT", "funding_time_missing"
     if minutes_to_funding < config.min_minutes_before_funding:
         return "REJECT", "too_close_to_funding"
+    interval_minutes = (funding_interval_hours or config.fallback_funding_interval_hours) * 60
+    minutes_since_previous_funding = interval_minutes - minutes_to_funding
+    if minutes_since_previous_funding < 0:
+        return "REJECT", "funding_cycle_time_mismatch"
+    if minutes_since_previous_funding < config.post_funding_entry_quarantine_minutes:
+        return "REJECT", "post_funding_rollover_quarantine"
+    if not funding_cycle_confirmed:
+        return "REJECT", "funding_cycle_unconfirmed"
     if expected_edge_pct is None or expected_edge_pct < config.min_expected_edge_pct:
         return "REJECT", "expected_edge_below_threshold"
     if not round_trip_fillable:
@@ -218,6 +244,11 @@ def scan_pair(
 ) -> list[OpportunityRow]:
     funding = fetch_funding_snapshot(client, pair, contracts_by_symbol)
     minutes = funding.minutes_to_funding(now)
+    funding_cycle_confirmed = _funding_cycle_confirmed(
+        pair.perp_symbol,
+        funding.funding_time_utc,
+        config.funding_cycle_confirmation_observations,
+    )
     shortlisted_directions = _shortlist_directions(
         config=config,
         funding_rate_pct=funding.funding_rate_pct,
@@ -313,6 +344,8 @@ def scan_pair(
                     direction=direction,
                     funding_benefit_pct=funding_benefit_pct,
                     minutes_to_funding=minutes,
+                    funding_interval_hours=funding.funding_interval_hours,
+                    funding_cycle_confirmed=funding_cycle_confirmed,
                     expected_edge_pct=expected_edge_pct,
                     round_trip_fillable=estimate.round_trip_fillable,
                     basis_observation_count=basis_stats.observation_count,

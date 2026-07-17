@@ -43,20 +43,9 @@ def fetch_funding_snapshot(
     contracts_by_symbol: dict[str, dict],
 ) -> FundingSnapshot:
     contract = contracts_by_symbol.get(pair.perp_symbol, {})
-    if contract.get("fundingFeeRate") not in (None, ""):
-        data = {
-            "fundingRate": contract.get("fundingFeeRate"),
-            "predictedFundingRate": contract.get("predictedFundingFeeRate"),
-            "fundingTime": contract.get("nextFundingRateDateTime"),
-            "granularity": (
-                contract.get("currentFundingRateGranularity")
-                or contract.get("fundingRateGranularity")
-            ),
-            "fundingRateCap": contract.get("fundingRateCap"),
-            "fundingRateFloor": contract.get("fundingRateFloor"),
-        }
-    else:
-        data = client.get_current_funding_rate(pair.perp_symbol)
+    # Keep the upcoming rate and its settlement timestamp from one atomic API
+    # response. Contract metadata can briefly straddle two cycles at rollover.
+    data = client.get_current_funding_rate(pair.perp_symbol)
 
     funding_rate = _as_float(
         data,
@@ -81,7 +70,11 @@ def fetch_funding_snapshot(
 
     interval_hours = _as_float(data, "fundingIntervalHours", "fundingInterval")
     if interval_hours is None:
-        interval_ms = _as_float(data, "granularity")
+        interval_ms = _as_float(data, "granularity", "currentGranularity") or _as_float(
+            contract,
+            "currentFundingRateGranularity",
+            "fundingRateGranularity",
+        )
         interval_hours = None if interval_ms is None else interval_ms / 1000 / 60 / 60
     if interval_hours is None:
         interval_hours = _as_float(contract, "fundingInterval") or 8.0
@@ -93,7 +86,34 @@ def fetch_funding_snapshot(
         predicted_funding_rate_pct=_decimal_rate_to_pct(predicted),
         funding_time_utc=funding_time,
         funding_interval_hours=interval_hours,
-        funding_rate_cap=_decimal_rate_to_pct(_as_float(data, "fundingRateCap", "maxFundingRate")),
-        funding_rate_floor=_decimal_rate_to_pct(_as_float(data, "fundingRateFloor", "minFundingRate")),
+        funding_rate_cap=_decimal_rate_to_pct(
+            _as_float(data, "fundingRateCap", "maxFundingRate")
+            or _as_float(contract, "fundingRateCap")
+        ),
+        funding_rate_floor=_decimal_rate_to_pct(
+            _as_float(data, "fundingRateFloor", "minFundingRate")
+            or _as_float(contract, "fundingRateFloor")
+        ),
         observed_at_utc=utc_now(),
     )
+
+
+def fetch_funding_settlements(
+    client: KucoinPublicClient,
+    exchange_symbol: str,
+    from_utc: datetime,
+    to_utc: datetime,
+) -> dict[datetime, float]:
+    rows = client.get_public_funding_history(
+        exchange_symbol,
+        int(from_utc.timestamp() * 1000) - 1_000,
+        int(to_utc.timestamp() * 1000) + 1_000,
+    )
+    settlements: dict[datetime, float] = {}
+    for row in rows:
+        funding_time = _as_datetime_from_ms(row, "timepoint", "timePoint", "fundingTime")
+        funding_rate = _as_float(row, "fundingRate", "value")
+        if funding_time is None or funding_rate is None:
+            continue
+        settlements[funding_time] = _decimal_rate_to_pct(funding_rate) or 0.0
+    return settlements
