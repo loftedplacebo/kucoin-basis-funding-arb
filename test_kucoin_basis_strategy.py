@@ -176,6 +176,25 @@ class FixedCurrentFundingClient:
         }
 
 
+class NoAtomicFundingCallClient(DummyKucoinClient):
+    def get_current_funding_rate(self, exchange_symbol: str) -> dict:
+        raise AssertionError("atomic endpoint should not be called")
+
+
+class ScannerAtomicFundingClient(DummyKucoinClient):
+    def __init__(self, rate: float, funding_time: datetime):
+        self.rate = rate
+        self.funding_time = funding_time
+        self.current_funding_calls = 0
+
+    def get_current_funding_rate(self, exchange_symbol: str) -> dict:
+        self.current_funding_calls += 1
+        return {
+            "nextFundingRate": str(self.rate),
+            "fundingTime": int(self.funding_time.timestamp() * 1000),
+        }
+
+
 class FailingFundingHistoryClient:
     def get_public_funding_history(
         self,
@@ -1522,6 +1541,63 @@ def test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist()
         assert all(row.reason == "open_position_watchlist" for row in watch_rows)
 
 
+def test_bulk_screen_skips_atomic_endpoint_for_irrelevant_symbol():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        pair = SymbolPair(base="MIRA", spot_symbol="MIRA-USDT", perp_symbol="MIRAUSDTM")
+        now = datetime.now(timezone.utc)
+        contracts = {
+            "MIRAUSDTM": {
+                "symbol": "MIRAUSDTM",
+                "fundingFeeRate": "0.001",
+                "predictedFundingFeeRate": "0.001",
+                "nextFundingRateDateTime": int((now + timedelta(hours=1)).timestamp() * 1000),
+                "currentFundingRateGranularity": 3600000,
+            }
+        }
+
+        rows = scan_pair(
+            NoAtomicFundingCallClient(),
+            config,
+            pair,
+            contracts,
+            now,
+        )
+
+        assert rows == []
+
+
+def test_open_position_watchlist_uses_atomic_rate_not_bulk_contract_rate():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        pair = SymbolPair(base="MIRA", spot_symbol="MIRA-USDT", perp_symbol="MIRAUSDTM")
+        now = datetime.now(timezone.utc)
+        funding_time = now + timedelta(hours=1)
+        client = ScannerAtomicFundingClient(rate=-0.005, funding_time=funding_time)
+        contracts = {
+            "MIRAUSDTM": {
+                "symbol": "MIRAUSDTM",
+                "fundingFeeRate": "0.005",
+                "predictedFundingFeeRate": "0.005",
+                "nextFundingRateDateTime": int(funding_time.timestamp() * 1000),
+                "currentFundingRateGranularity": 3600000,
+            }
+        }
+
+        rows = scan_pair(
+            client,
+            config,
+            pair,
+            contracts,
+            now,
+            {"MIRA": {"SHORT_SPOT_LONG_PERP": {100.0}}},
+        )
+
+        assert client.current_funding_calls == 1
+        assert rows
+        assert all(row.funding_rate_pct == -0.5 for row in rows)
+
+
 def test_adverse_basis_with_weak_funding_tries_profitable_unwind():
     config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30)
     position = make_position(
@@ -1661,6 +1737,8 @@ if __name__ == "__main__":
     test_summary_totals_do_not_double_count_open_funding()
     test_decision_schema_upgrade_preserves_legacy_rows()
     test_open_position_watchlist_rows_are_scanned_even_without_entry_shortlist()
+    test_bulk_screen_skips_atomic_endpoint_for_irrelevant_symbol()
+    test_open_position_watchlist_uses_atomic_rate_not_bulk_contract_rate()
     test_adverse_basis_with_weak_funding_tries_profitable_unwind()
     test_adverse_basis_existing_position_blocks_add()
     test_volatility_cooldown_blocks_reentry_for_60_minutes()

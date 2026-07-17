@@ -242,7 +242,26 @@ def scan_pair(
     now: datetime,
     watchlist: dict[str, dict[str, set[float]]] | None = None,
 ) -> list[OpportunityRow]:
-    funding = fetch_funding_snapshot(client, pair, contracts_by_symbol)
+    # Use the bulk contract feed only to identify symbols worth inspecting. Any
+    # symbol that can enter or is already open is then verified atomically.
+    funding = fetch_funding_snapshot(
+        client,
+        pair,
+        contracts_by_symbol,
+        atomic=False,
+    )
+    minutes = funding.minutes_to_funding(now)
+    shortlisted_directions = _shortlist_directions(
+        config=config,
+        funding_rate_pct=funding.funding_rate_pct,
+        minutes_to_funding=minutes,
+    )
+    watched_by_direction = (watchlist or {}).get(pair.base, {})
+    directions = sorted(set(shortlisted_directions) | set(watched_by_direction))
+    if not directions:
+        return []
+
+    funding = fetch_funding_snapshot(client, pair, contracts_by_symbol, atomic=True)
     minutes = funding.minutes_to_funding(now)
     funding_cycle_confirmed = _funding_cycle_confirmed(
         pair.perp_symbol,
@@ -254,7 +273,6 @@ def scan_pair(
         funding_rate_pct=funding.funding_rate_pct,
         minutes_to_funding=minutes,
     )
-    watched_by_direction = (watchlist or {}).get(pair.base, {})
     directions = sorted(set(shortlisted_directions) | set(watched_by_direction))
     if not directions:
         return []

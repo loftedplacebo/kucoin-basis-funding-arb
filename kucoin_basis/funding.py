@@ -41,11 +41,26 @@ def fetch_funding_snapshot(
     client: KucoinPublicClient,
     pair: SymbolPair,
     contracts_by_symbol: dict[str, dict],
+    *,
+    atomic: bool = True,
 ) -> FundingSnapshot:
     contract = contracts_by_symbol.get(pair.perp_symbol, {})
-    # Keep the upcoming rate and its settlement timestamp from one atomic API
-    # response. Contract metadata can briefly straddle two cycles at rollover.
-    data = client.get_current_funding_rate(pair.perp_symbol)
+    if atomic or contract.get("fundingFeeRate") in (None, ""):
+        # Keep the upcoming rate and its settlement timestamp from one atomic API
+        # response. Contract metadata can briefly straddle two cycles at rollover.
+        data = client.get_current_funding_rate(pair.perp_symbol)
+    else:
+        data = {
+            "fundingRate": contract.get("fundingFeeRate"),
+            "predictedFundingRate": contract.get("predictedFundingFeeRate"),
+            "fundingTime": contract.get("nextFundingRateDateTime"),
+            "granularity": (
+                contract.get("currentFundingRateGranularity")
+                or contract.get("fundingRateGranularity")
+            ),
+            "fundingRateCap": contract.get("fundingRateCap"),
+            "fundingRateFloor": contract.get("fundingRateFloor"),
+        }
 
     funding_rate = _as_float(
         data,
