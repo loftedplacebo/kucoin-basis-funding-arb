@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 from core.models import OrderBook, OrderBookLevel
 from kucoin_basis.config import KucoinBasisConfig
 from kucoin_basis.models import OpportunityRow, SymbolPair, parse_float
-from kucoin_basis.funding_dashboard import _position_unwind_estimates, load_summary_payload
+from kucoin_basis.funding_dashboard import (
+    HTML,
+    _position_unwind_estimates,
+    load_positions_payload,
+    load_summary_payload,
+)
 from kucoin_basis.opportunity_scanner import scan_pair
 from kucoin_basis.paper_models import PaperPosition
 from kucoin_basis.paper_store import DECISION_FIELDS, PaperStore
@@ -580,6 +585,41 @@ def test_dashboard_unwind_status_matches_moderate_funding_triggers():
     assert attractive["next_unwind_status"] == "strong all-in unwind"
 
 
+def test_positions_dashboard_separates_entry_and_next_funding_estimates():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            notional_usd=500.0,
+            expected_funding_pct=0.5,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=datetime.now(timezone.utc) - timedelta(seconds=30),
+            funding_rate_pct=-1.2,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        write_opportunities(
+            config.opportunities_dir / "kucoin_basis_opportunities_test.csv",
+            [row],
+        )
+
+        payload = load_positions_payload(config)
+        dashboard_position = payload["positions"][0]
+
+        assert parse_float(dashboard_position["expected_funding_pct"]) == 0.5
+        assert parse_float(dashboard_position["expected_funding_pnl_usd"]) == 2.5
+        assert parse_float(dashboard_position["next_funding_pct"]) == 1.2
+        assert parse_float(dashboard_position["next_funding_pnl_usd"]) == 6.0
+        assert "<th>Entry funding</th>" in HTML
+        assert "<th>Entry-rate PnL</th>" in HTML
+        assert "<th>Next funding</th>" in HTML
+        assert "<th>Next fund PnL</th>" in HTML
+
+
 def test_profitable_post_funding_unwind_closes_best_chunk_only():
     with TemporaryDirectory() as tmp:
         config = make_config(Path(tmp))
@@ -1042,6 +1082,7 @@ if __name__ == "__main__":
     test_capital_recycle_rejects_excessive_exit_cost()
     test_juicy_funding_blocks_even_an_unusually_attractive_exit()
     test_dashboard_unwind_status_matches_moderate_funding_triggers()
+    test_positions_dashboard_separates_entry_and_next_funding_estimates()
     test_profitable_post_funding_unwind_closes_best_chunk_only()
     test_post_close_cooldown_blocks_same_loop_reentry()
     test_profitable_carry_unwind_requires_profit_excluding_funding()

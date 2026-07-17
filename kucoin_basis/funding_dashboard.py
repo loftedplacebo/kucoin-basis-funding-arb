@@ -371,8 +371,10 @@ HTML = """<!doctype html>
               <th>Notional</th>
               <th>Age</th>
               <th>Funding state</th>
-              <th>Exp funding</th>
-              <th>Exp fund PnL</th>
+              <th>Entry funding</th>
+              <th>Entry-rate PnL</th>
+              <th>Next funding</th>
+              <th>Next fund PnL</th>
               <th>Entry basis</th>
               <th>Current basis</th>
               <th>Basis improvement</th>
@@ -692,6 +694,8 @@ HTML = """<!doctype html>
           <td class="${fundingStateClass(position.funding_state)}">${position.funding_state || ""}</td>
           <td class="${Number(position.expected_funding_pct || 0) >= 0 ? "positive" : "negative"}">${fmtPct(position.expected_funding_pct)}</td>
           <td class="${Number(position.expected_funding_pnl_usd || 0) >= 0 ? "positive" : "negative"}">${fmtMoney(position.expected_funding_pnl_usd)}</td>
+          <td class="${Number(position.next_funding_pct || 0) >= 0 ? "positive" : "negative"}">${fmtPct(position.next_funding_pct)}</td>
+          <td class="${Number(position.next_funding_pnl_usd || 0) >= 0 ? "positive" : "negative"}">${fmtMoney(position.next_funding_pnl_usd)}</td>
           <td>${fmtPct(position.entry_basis_pct)}</td>
           <td>${fmtPct(position.current_basis_pct)}</td>
           <td class="${improvement >= 0 ? "positive" : "negative"}">${fmtPct(improvement)}</td>
@@ -1420,6 +1424,21 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     positions = []
     for position in all_positions:
         row = position.to_csv_row()
+        market_rows = latest_rows_by_position.get((position.base, position.direction), [])
+        latest_market_row = next(
+            (candidate for candidate in market_rows if candidate.funding_rate_pct is not None),
+            None,
+        )
+        next_funding_pct = (
+            _position_funding_benefit_pct(position, latest_market_row)
+            if latest_market_row is not None
+            else None
+        )
+        next_funding_pnl = (
+            position.notional_usd * next_funding_pct / 100
+            if next_funding_pct is not None
+            else None
+        )
         if position.direction == "SHORT_SPOT_LONG_PERP":
             basis_improvement = position.current_basis_pct - position.entry_basis_pct
         else:
@@ -1435,6 +1454,8 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         row["basis_improvement_pct"] = f"{basis_improvement:.8f}"
         row["age_label"] = _age_label(position.created_at, now)
         row["expected_funding_pnl_usd"] = f"{expected_funding_pnl:.8f}"
+        row["next_funding_pct"] = "" if next_funding_pct is None else f"{next_funding_pct:.8f}"
+        row["next_funding_pnl_usd"] = "" if next_funding_pnl is None else f"{next_funding_pnl:.8f}"
         row["funding_coverage_ratio"] = "" if funding_coverage_ratio is None else f"{funding_coverage_ratio:.8f}"
         row["funding_due"] = str(funding_due)
         if funding_due:
@@ -1449,7 +1470,7 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         row["symbol_usage_usd"] = f"{open_notional_by_base.get(position.base, 0.0):.8f}"
         row.update(_position_unwind_estimates(
             position,
-            latest_rows_by_position.get((position.base, position.direction), []),
+            market_rows,
             config,
         ))
         positions.append(row)
