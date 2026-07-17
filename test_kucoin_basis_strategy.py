@@ -20,7 +20,7 @@ from kucoin_basis.opportunity_scanner import (
     scan_pair,
 )
 from kucoin_basis.paper_models import PaperPosition
-from kucoin_basis.paper_store import DECISION_FIELDS, PaperStore
+from kucoin_basis.paper_store import DECISION_FIELDS, POSITION_FIELDS, PaperStore
 from kucoin_basis.paper_strategy import _accrue_funding_if_crossed, _choose_partial_close, _should_exit, run_paper_strategy_once
 
 
@@ -354,6 +354,379 @@ def test_funding_history_failure_keeps_funding_pending_for_retry():
         assert position.funding_events_captured == 0
         assert position.next_funding_time == funding_time
         assert not store.funding_events_path.exists()
+
+
+def test_pre_funding_reversal_gently_unwinds_least_loss_chunk():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            funding_events_captured=0,
+            realised_funding_pnl_usd=0.0,
+            next_funding_time=now + timedelta(minutes=30),
+            adverse_funding_since=now - timedelta(minutes=61),
+        )
+        store.write_positions({position.position_id: position})
+        adverse_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=0.2,
+            funding_time_utc=now + timedelta(minutes=30),
+            minutes_to_funding=30.0,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [adverse_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fill = list(csv.DictReader(f))[-1]
+        assert fill["event_type"] == "PARTIAL_CLOSE"
+        assert parse_float(fill["notional_usd"]) == 100.0
+        assert parse_float(fill["realised_pnl_usd"]) < 0
+        assert fill["reason"] == "pre_funding_reversal_toxic_unwind"
+
+
+def test_post_funding_reversal_can_unwind_all_in_losing_chunk():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            funding_events_captured=2,
+            realised_funding_pnl_usd=0.50,
+            next_funding_time=now + timedelta(minutes=30),
+            adverse_funding_since=now - timedelta(minutes=61),
+        )
+        store.write_positions({position.position_id: position})
+        adverse_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=0.2,
+            funding_time_utc=now + timedelta(minutes=30),
+            minutes_to_funding=30.0,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [adverse_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fill = list(csv.DictReader(f))[-1]
+        assert parse_float(fill["realised_pnl_usd"]) < 0
+        assert parse_float(fill["realised_funding_pnl_usd"]) > 0
+        assert (
+            (parse_float(fill["realised_pnl_usd"], 0.0) or 0.0)
+            + (parse_float(fill["realised_funding_pnl_usd"], 0.0) or 0.0)
+        ) < 0
+        assert fill["reason"] == "post_funding_reversal_toxic_unwind"
+
+
+def test_confirmed_reversal_waits_when_exit_loss_exceeds_next_funding_cost():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            funding_events_captured=1,
+            realised_funding_pnl_usd=0.0,
+            next_funding_time=now + timedelta(hours=4),
+            adverse_funding_since=now - timedelta(minutes=61),
+        )
+        store.write_positions({position.position_id: position})
+        adverse_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=0.2,
+            funding_time_utc=now + timedelta(hours=4),
+            minutes_to_funding=240.0,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [adverse_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 500.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            exit_decision = [
+                row for row in csv.DictReader(f) if row["decision_type"] == "EXIT"
+            ][-1]
+        assert exit_decision["reason"] == "toxic_unwind_waiting_for_price_or_pace"
+
+
+def test_confirmed_reversal_exits_early_when_cheaper_than_adverse_funding():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            funding_events_captured=1,
+            realised_funding_pnl_usd=0.0,
+            next_funding_time=now + timedelta(hours=4),
+            adverse_funding_since=now - timedelta(minutes=61),
+        )
+        store.write_positions({position.position_id: position})
+        adverse_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=1.0,
+            funding_time_utc=now + timedelta(hours=4),
+            minutes_to_funding=240.0,
+            spot_ask=100.02,
+            perp_bid=99.98,
+            spot_exit_avg_price=100.02,
+            perp_exit_avg_price=99.98,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [adverse_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fill = list(csv.DictReader(f))[-1]
+        assert parse_float(fill["notional_usd"]) == 100.0
+        assert fill["reason"] == "post_funding_reversal_toxic_unwind"
+
+
+def test_timed_exit_waits_for_better_prices_early_in_40_to_48_hour_window():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            created_at=now - timedelta(hours=40, minutes=5),
+            next_funding_time=now + timedelta(hours=2),
+        )
+        store.write_positions({position.position_id: position})
+        lossy_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=-1.5,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [lossy_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 500.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            exit_decision = [
+                row for row in csv.DictReader(f) if row["decision_type"] == "EXIT"
+            ][-1]
+        assert exit_decision["reason"] == "timed_exit_waiting_for_better_price"
+
+
+def test_timed_exit_forces_gentle_chunk_with_one_hour_buffer():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            created_at=now - timedelta(hours=47),
+            next_funding_time=now + timedelta(hours=2),
+        )
+        store.write_positions({position.position_id: position})
+        lossy_row = replace_row(
+            make_row(500.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=-1.5,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [lossy_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fill = list(csv.DictReader(f))[-1]
+        assert parse_float(fill["notional_usd"]) == 100.0
+        assert parse_float(fill["realised_pnl_usd"]) < 0
+        assert fill["reason"] == "timed_exit_unwind"
+
+
+def test_48_hour_deadline_closes_full_executable_remainder():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            created_at=now - timedelta(hours=48, minutes=1),
+            next_funding_time=now + timedelta(hours=2),
+        )
+        store.write_positions({position.position_id: position})
+        lossy_row = replace_row(
+            make_row(500.0, 2.0, 2.0),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=-1.5,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [lossy_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert position.position_id not in store.load_open_positions()
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fill = list(csv.DictReader(f))[-1]
+        assert fill["event_type"] == "CLOSE_POSITION"
+        assert parse_float(fill["notional_usd"]) == 500.0
+        assert fill["reason"] == "timed_exit_deadline"
+
+
+def test_toxic_or_timed_unwind_blocks_position_adds():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            created_at=now - timedelta(hours=40, minutes=5),
+            next_funding_time=now + timedelta(hours=2),
+        )
+        store.write_positions({position.position_id: position})
+        candidate = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=-1.5,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [candidate])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 500.0
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            entry_decision = [
+                row for row in csv.DictReader(f) if row["decision_type"] == "ENTRY"
+            ][-1]
+        assert entry_decision["allowed"] == "False"
+        assert entry_decision["reason"] == "toxic_or_timed_unwind_no_add"
+
+
+def test_adverse_funding_freezes_adds_before_toxic_exit_is_confirmed():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        now = datetime.now(timezone.utc)
+        position = make_position(
+            created_at=now - timedelta(hours=2),
+            next_funding_time=now + timedelta(hours=4),
+        )
+        store.write_positions({position.position_id: position})
+        candidate = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=10),
+            funding_rate_pct=0.2,
+            funding_time_utc=now + timedelta(hours=4),
+            minutes_to_funding=240.0,
+            spot_ask=101.0,
+            perp_bid=99.0,
+            spot_exit_avg_price=101.0,
+            perp_exit_avg_price=99.0,
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [candidate])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        reloaded = store.load_open_positions()[position.position_id]
+        assert reloaded.notional_usd == 500.0
+        assert reloaded.adverse_funding_since is not None
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            entry_decision = [
+                row for row in csv.DictReader(f) if row["decision_type"] == "ENTRY"
+            ][-1]
+        assert entry_decision["allowed"] == "False"
+        assert entry_decision["reason"] == "toxic_or_timed_unwind_no_add"
+
+
+def test_dashboard_shows_timed_exit_instead_of_juicy_funding_hold():
+    now = datetime.now(timezone.utc)
+    position = make_position(
+        created_at=now - timedelta(hours=41),
+        next_funding_time=now + timedelta(hours=2),
+    )
+    juicy_row = replace_row(
+        make_row(100.0, 0.01, 0.01),
+        funding_rate_pct=-1.5,
+        funding_time_utc=now + timedelta(hours=2),
+    )
+
+    estimates = _position_unwind_estimates(position, [juicy_row], KucoinBasisConfig())
+
+    assert estimates["next_unwind_status"] == "40-48h timed exit"
+
+
+def test_legacy_position_schema_loads_before_toxic_state_is_added():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        legacy_fields = [field for field in POSITION_FIELDS if field != "adverse_funding_since"]
+        legacy_row = make_position().to_csv_row()
+        with store.positions_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=legacy_fields)
+            writer.writeheader()
+            writer.writerow({field: legacy_row.get(field, "") for field in legacy_fields})
+
+        positions = store.load_open_positions()
+
+        loaded = next(iter(positions.values()))
+        assert loaded.adverse_funding_since is None
+        store.write_positions(positions)
+        with store.positions_path.open("r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            list(reader)
+            assert reader.fieldnames == POSITION_FIELDS
 
 
 def test_add_position_fill_logs_added_chunk_not_running_total():
@@ -1253,6 +1626,17 @@ if __name__ == "__main__":
     test_funding_accrual_uses_exact_settlement_not_current_cycle_rate()
     test_missing_settlement_history_keeps_funding_pending_for_retry()
     test_funding_history_failure_keeps_funding_pending_for_retry()
+    test_pre_funding_reversal_gently_unwinds_least_loss_chunk()
+    test_post_funding_reversal_can_unwind_all_in_losing_chunk()
+    test_confirmed_reversal_waits_when_exit_loss_exceeds_next_funding_cost()
+    test_confirmed_reversal_exits_early_when_cheaper_than_adverse_funding()
+    test_timed_exit_waits_for_better_prices_early_in_40_to_48_hour_window()
+    test_timed_exit_forces_gentle_chunk_with_one_hour_buffer()
+    test_48_hour_deadline_closes_full_executable_remainder()
+    test_toxic_or_timed_unwind_blocks_position_adds()
+    test_adverse_funding_freezes_adds_before_toxic_exit_is_confirmed()
+    test_dashboard_shows_timed_exit_instead_of_juicy_funding_hold()
+    test_legacy_position_schema_loads_before_toxic_state_is_added()
     test_add_position_fill_logs_added_chunk_not_running_total()
     test_stale_close_row_is_not_used_for_exit_decision()
     test_adverse_basis_holds_instead_of_hard_exit()

@@ -32,6 +32,7 @@ POSITION_FIELDS = [
     "next_funding_time",
     "funding_events_captured",
     "funding_interval_hours",
+    "adverse_funding_since",
     "status",
 ]
 

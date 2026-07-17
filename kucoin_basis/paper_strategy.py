@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -284,6 +285,205 @@ def _funding_benefit_pct(position: PaperPosition, row: OpportunityRow) -> float 
     if position.direction == "LONG_SPOT_SHORT_PERP":
         return row.funding_rate_pct
     return -row.funding_rate_pct
+
+
+TOXIC_UNWIND_REASONS = {
+    "pre_funding_reversal_toxic_unwind",
+    "post_funding_reversal_toxic_unwind",
+    "timed_exit_unwind",
+    "timed_exit_deadline",
+}
+
+
+def _position_age_hours(position: PaperPosition, now: datetime) -> float:
+    return max(0.0, (now - position.created_at).total_seconds() / 3600)
+
+
+def _update_adverse_funding_state(
+    position: PaperPosition,
+    row: OpportunityRow,
+    config: KucoinBasisConfig,
+    now: datetime,
+) -> None:
+    funding_benefit_pct = _funding_benefit_pct(position, row)
+    if funding_benefit_pct is None:
+        return
+    if funding_benefit_pct < config.toxic_adverse_funding_threshold_pct:
+        position.adverse_funding_since = position.adverse_funding_since or now
+    else:
+        position.adverse_funding_since = None
+
+
+def _forced_unwind_reason(
+    position: PaperPosition,
+    row: OpportunityRow,
+    config: KucoinBasisConfig,
+    now: datetime,
+) -> str | None:
+    age_hours = _position_age_hours(position, now)
+    if config.timed_exit_enabled and age_hours >= config.timed_exit_deadline_hours:
+        return "timed_exit_deadline"
+    if config.timed_exit_enabled and age_hours >= config.timed_exit_start_hours:
+        return "timed_exit_unwind"
+    if not config.toxic_unwind_enabled:
+        return None
+
+    funding_benefit_pct = _funding_benefit_pct(position, row)
+    if (
+        funding_benefit_pct is None
+        or funding_benefit_pct >= config.toxic_adverse_funding_threshold_pct
+        or position.adverse_funding_since is None
+    ):
+        return None
+
+    adverse_minutes = (now - position.adverse_funding_since).total_seconds() / 60
+    funding_time = row.funding_time_utc or position.next_funding_time
+    minutes_to_funding = (
+        (funding_time - now).total_seconds() / 60
+        if funding_time is not None
+        else None
+    )
+    confirmed = adverse_minutes >= config.toxic_funding_confirmation_minutes
+    deadline_near = (
+        minutes_to_funding is not None
+        and minutes_to_funding <= config.toxic_unwind_start_minutes_before_funding
+    )
+    if not confirmed and not deadline_near:
+        return None
+    return (
+        "pre_funding_reversal_toxic_unwind"
+        if position.funding_events_captured <= 0
+        else "post_funding_reversal_toxic_unwind"
+    )
+
+
+def _forced_unwind_deadline(
+    position: PaperPosition,
+    row: OpportunityRow,
+    reason: str,
+    config: KucoinBasisConfig,
+) -> datetime:
+    if reason in {"timed_exit_unwind", "timed_exit_deadline"}:
+        return position.created_at + timedelta(hours=config.timed_exit_deadline_hours)
+    funding_time = row.funding_time_utc or position.next_funding_time
+    if funding_time is not None:
+        return funding_time - timedelta(minutes=config.min_minutes_before_funding)
+    return utc_now() + timedelta(minutes=config.toxic_funding_confirmation_minutes)
+
+
+def _choose_forced_unwind_close(
+    rows: list[OpportunityRow],
+    *,
+    base: str,
+    direction: str,
+    position: PaperPosition,
+    reason: str,
+    config: KucoinBasisConfig,
+    now: datetime,
+) -> tuple[float, OpportunityRow, ExitEstimate] | None:
+    matching_rows = [
+        row for row in rows if row.base == base and row.direction == direction
+    ]
+    reference_row = max(matching_rows, key=lambda row: row.timestamp_utc) if matching_rows else None
+    if reference_row is None:
+        return None
+    deadline = _forced_unwind_deadline(position, reference_row, reason, config)
+    remaining_seconds = (deadline - now).total_seconds()
+    deadline_reached = remaining_seconds <= 0 or reason == "timed_exit_deadline"
+    if deadline_reached:
+        required_chunk = position.notional_usd
+        max_exit_cost_pct = None
+    else:
+        cycles_remaining = max(
+            1,
+            int(remaining_seconds // max(1.0, config.orderbook_monitor_interval_seconds)),
+        )
+        chunks_remaining = max(
+            1,
+            math.ceil(position.notional_usd / max(0.01, config.toxic_unwind_chunk_usd)),
+        )
+        pace_buffer_minutes = (
+            config.timed_exit_pace_buffer_minutes
+            if reason == "timed_exit_unwind"
+            else config.toxic_unwind_pace_buffer_minutes
+        )
+        pace_buffer_cycles = int(
+            pace_buffer_minutes * 60 / max(1.0, config.orderbook_monitor_interval_seconds)
+        )
+        forced_pace = cycles_remaining <= chunks_remaining + pace_buffer_cycles
+        required_chunk = max(
+            config.toxic_unwind_chunk_usd,
+            position.notional_usd / cycles_remaining,
+        )
+        max_exit_cost_pct = config.toxic_max_exit_cost_pct
+        if reason == "timed_exit_unwind":
+            age_progress = (
+                _position_age_hours(position, now) - config.timed_exit_start_hours
+            ) / max(0.01, config.timed_exit_deadline_hours - config.timed_exit_start_hours)
+            max_exit_cost_pct *= 1 + min(1.0, max(0.0, age_progress))
+
+    chunk_sizes = {
+        min(position.notional_usd, config.toxic_unwind_chunk_usd),
+        position.notional_usd,
+        *(
+            min(position.notional_usd, chunk)
+            for chunk in config.gentle_unwind_chunk_ladder_usd
+        ),
+    }
+    candidates: list[tuple[float, OpportunityRow, ExitEstimate]] = []
+    for chunk in sorted(chunk_sizes):
+        if chunk <= 0:
+            continue
+        exit_row = _choose_full_close_row(
+            rows,
+            base=base,
+            direction=direction,
+            notional_usd=chunk,
+        )
+        if exit_row is None:
+            continue
+        estimate = _estimate_exit_chunk(position, exit_row, config, chunk)
+        if estimate is None:
+            continue
+        if (
+            max_exit_cost_pct is not None
+            and _exit_slippage_cost_pct(exit_row, config) > max_exit_cost_pct
+        ):
+            continue
+        candidates.append((chunk, exit_row, estimate))
+    if not candidates:
+        return None
+
+    if not deadline_reached and not forced_pace:
+        if reason == "timed_exit_unwind":
+            return None
+        adverse_funding_pct = max(
+            0.0,
+            -(_funding_benefit_pct(position, reference_row) or 0.0),
+        )
+        economically_preferred = [
+            candidate
+            for candidate in candidates
+            if max(0.0, -candidate[2].net_pnl_usd)
+            <= candidate[0] * adverse_funding_pct / 100
+        ]
+        if not economically_preferred:
+            return None
+        candidates = economically_preferred
+
+    on_pace = [candidate for candidate in candidates if candidate[0] + 1e-8 >= required_chunk]
+    if not on_pace:
+        return max(candidates, key=lambda candidate: candidate[0])
+    if deadline_reached:
+        return max(on_pace, key=lambda candidate: (candidate[0], candidate[2].net_pnl_pct))
+    return max(
+        on_pace,
+        key=lambda candidate: (
+            round(candidate[2].net_pnl_pct, 10),
+            candidate[2].net_pnl_usd,
+            -candidate[0],
+        ),
+    )
 
 
 def _basis_target_reason(position: PaperPosition, config: KucoinBasisConfig) -> str | None:
@@ -669,7 +869,18 @@ def run_paper_strategy_once(
             )
             continue
         _mark_position(position, row, config)
+        position_now = utc_now()
+        _update_adverse_funding_state(position, row, config, position_now)
         should_exit, reason = _should_exit(position, row, config)
+        forced_unwind_reason = _forced_unwind_reason(
+            position,
+            row,
+            config,
+            position_now,
+        )
+        if forced_unwind_reason is not None:
+            should_exit = True
+            reason = forced_unwind_reason
         selected_exit: tuple[float, OpportunityRow, ExitEstimate] | None = None
         foregone_funding_usd: float | None = None
         pre_funding_exit_profit_usd: float | None = None
@@ -751,6 +962,13 @@ def run_paper_strategy_once(
             exit_mode = "attractive_all_in"
         elif reason == "capital_recycle_profitable_unwind":
             exit_mode = "capital_recycle"
+        elif reason in {
+            "pre_funding_reversal_toxic_unwind",
+            "post_funding_reversal_toxic_unwind",
+        }:
+            exit_mode = "toxic_unwind"
+        elif reason in {"timed_exit_unwind", "timed_exit_deadline"}:
+            exit_mode = "timed_exit"
         else:
             exit_mode = "hold"
         exit_audit_fields = {
@@ -838,6 +1056,7 @@ def run_paper_strategy_once(
                     "funding_captured_holding_edge_weak",
                     "basis_converged_take_profit",
                     "basis_near_flat_take_profit",
+                    *TOXIC_UNWIND_REASONS,
                 }:
                     harvest = _choose_funding_harvest_close(
                         opportunities,
@@ -850,7 +1069,29 @@ def run_paper_strategy_once(
                         exit_chunk, exit_row, exit_estimate = harvest
                         reason = "funding_harvest_profitable_unwind"
 
+                if exit_chunk is None and reason in TOXIC_UNWIND_REASONS:
+                    forced_close = _choose_forced_unwind_close(
+                        opportunities,
+                        base=position.base,
+                        direction=position.direction,
+                        position=position,
+                        reason=reason,
+                        config=config,
+                        now=utc_now(),
+                    )
+                    if forced_close is not None:
+                        exit_chunk, exit_row, exit_estimate = forced_close
+
             if exit_chunk is None or exit_estimate is None:
+                if reason == "timed_exit_unwind":
+                    no_exit_reason = "timed_exit_waiting_for_better_price"
+                elif reason in {
+                    "pre_funding_reversal_toxic_unwind",
+                    "post_funding_reversal_toxic_unwind",
+                }:
+                    no_exit_reason = "toxic_unwind_waiting_for_price_or_pace"
+                else:
+                    no_exit_reason = "exit_wanted_no_profitable_chunk"
                 store.append_decision(
                     {
                         "timestamp_utc": format_datetime(utc_now()),
@@ -860,7 +1101,7 @@ def run_paper_strategy_once(
                         "position_id": position.position_id,
                         "opportunity_key": row.opportunity_key,
                         "allowed": "False",
-                        "reason": "exit_wanted_no_profitable_chunk",
+                        "reason": no_exit_reason,
                         "notional_usd": f"{position.notional_usd:.8f}",
                         "expected_edge_pct": "" if row.expected_edge_pct is None else f"{row.expected_edge_pct:.8f}",
                         "estimated_net_pnl_usd": f"{position.estimated_net_pnl_usd:.8f}",
@@ -950,6 +1191,12 @@ def run_paper_strategy_once(
                 reason=reason,
                 config=config,
             )
+        elif allowed and existing_position is not None and (
+            existing_position.adverse_funding_since is not None
+            or _position_age_hours(existing_position, utc_now()) >= config.timed_exit_start_hours
+        ):
+            allowed = False
+            reason = "toxic_or_timed_unwind_no_add"
         elif existing_position is None and len(positions) >= config.max_open_positions:
             allowed = False
             reason = "max_open_positions"

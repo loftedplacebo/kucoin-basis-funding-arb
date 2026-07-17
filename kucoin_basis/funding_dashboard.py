@@ -25,6 +25,7 @@ from kucoin_basis.paper_strategy import (
     _basis_target_reason,
     _estimate_exit_chunk,
     _exit_slippage_cost_pct,
+    _forced_unwind_reason,
     _funding_benefit_pct as _position_funding_benefit_pct,
 )
 from kucoin_basis.paper_store import PaperStore
@@ -1156,8 +1157,23 @@ def _position_unwind_estimates(position, rows: list[OpportunityRow], config: Kuc
         and estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd
         and _exit_slippage_cost_pct(row, config) <= config.max_entry_exit_cost_pct
     )
+    forced_unwind_reason = _forced_unwind_reason(
+        position,
+        row,
+        config,
+        datetime.now(timezone.utc),
+    )
 
-    if position.funding_events_captured <= 0:
+    if forced_unwind_reason == "timed_exit_deadline":
+        status = "48h deadline exit"
+    elif forced_unwind_reason == "timed_exit_unwind":
+        status = "40-48h timed exit"
+    elif forced_unwind_reason in {
+        "pre_funding_reversal_toxic_unwind",
+        "post_funding_reversal_toxic_unwind",
+    }:
+        status = "toxic funding unwind"
+    elif position.funding_events_captured <= 0:
         foregone_funding_usd = chunk * max(0.0, funding_benefit_pct or 0.0) / 100
         pre_funding_hurdle = max(
             config.pre_funding_take_profit_min_profit_usd,

@@ -50,6 +50,17 @@ class KucoinBasisConfig:
     gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
     funding_harvest_unwind_chunk_usd: float = 100.0
     min_funding_harvest_unwind_profit_usd: float = 0.25
+    toxic_unwind_enabled: bool = True
+    toxic_unwind_chunk_usd: float = 100.0
+    toxic_adverse_funding_threshold_pct: float = 0.0
+    toxic_funding_confirmation_minutes: float = 60.0
+    toxic_unwind_start_minutes_before_funding: float = 90.0
+    toxic_unwind_pace_buffer_minutes: float = 15.0
+    toxic_max_exit_cost_pct: float = 1.00
+    timed_exit_enabled: bool = True
+    timed_exit_start_hours: float = 40.0
+    timed_exit_deadline_hours: float = 48.0
+    timed_exit_pace_buffer_minutes: float = 60.0
     pre_funding_take_profit_enabled: bool = True
     pre_funding_take_profit_min_basis_improvement_pct: float = 2.00
     pre_funding_take_profit_min_profit_usd: float = 5.00
