@@ -23,6 +23,9 @@ POST requests to any non-test endpoint are refused in code. See
 The database, execution, leverage, liquidity, reconciliation, and account
 rebalancing work required before live trading is tracked in
 [`docs/live-next-steps.md`](docs/live-next-steps.md).
+The design-only proposal for using a Binance, OKX, or MEXC perpetual as a
+fallback when KuCoin spot borrowing is unavailable is in
+[`docs/cross-exchange-futures-fallback.md`](docs/cross-exchange-futures-fallback.md).
 
 ## Run Locally
 
