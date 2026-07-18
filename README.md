@@ -1,6 +1,12 @@
 # KuCoin Basis Funding Arb
 
-Paper-trading research tooling for KuCoin spot/perp funding arbitrage.
+Research and execution-validation tooling for KuCoin spot/perp funding
+arbitrage. The strategy runs in public-data paper mode by default and provides
+an explicitly selected authenticated dry-run mode.
+
+The complete activation, entry, add, hold, funding, and exit specification is in
+[`kucoin_basis/README.md`](kucoin_basis/README.md). That package document is the
+authoritative operating description for the funding strategy.
 
 The strategy supports both funding directions:
 
@@ -9,7 +15,11 @@ positive funding: buy spot + short perp
 negative funding: short spot + long perp
 ```
 
-It currently uses public KuCoin REST data only. There are no API keys, authenticated clients, live order placement paths, or margin trading execution paths. The short-spot direction is paper-only modelling.
+There is no live execution mode. Dry run re-fetches current depth, applies
+KuCoin precision and contract rules, checks margin borrow availability, and
+validates both hedge legs through non-matching `/test` endpoints. Authenticated
+POST requests to any non-test endpoint are refused in code. See
+[`docs/dry-run.md`](docs/dry-run.md) for the safety boundary and setup.
 
 ## Run Locally
 
@@ -31,6 +41,19 @@ Open:
 
 ```text
 http://127.0.0.1:8766/
+```
+
+Run the authenticated strategy dry run and its isolated dashboard:
+
+```powershell
+python kucoin_basis\run_paper_strategy.py --execution-mode dry-run --loop --interval 60
+python kucoin_basis\run_funding_dashboard.py --state-mode dry-run --host 127.0.0.1 --port 8767
+```
+
+Verify credentials and all three non-matching test-order endpoints:
+
+```powershell
+python scripts\test_kucoin_connection.py --full
 ```
 
 Print a paper summary:
@@ -108,6 +131,10 @@ Useful audit files:
 - `data/kucoin_basis/paper/decisions.csv`: every paper entry/exit decision with allow/deny reason.
 - `data/kucoin_basis/paper/fills.csv`: paper opens, adds, partial closes, and closes.
 - `data/kucoin_basis/paper/funding_events.csv`: booked funding events.
+- `data/kucoin_basis/dry_run/`: isolated dry-run positions, decisions, fills,
+  funding events, and execution preflights.
+- `data/kucoin_basis/dry_run/execution_attempts.csv`: quantized two-leg order
+  plans and KuCoin test-order acceptance results.
 
 The basis-convergence strategy writes separate files under:
 
@@ -118,12 +145,12 @@ data/kucoin_basis_convergence/
 ## Tests
 
 ```powershell
-python -m py_compile kucoin_basis\*.py core\*.py test_kucoin_basis_strategy.py
 python test_kucoin_basis_strategy.py
 python test_kucoin_basis_convergence_strategy.py
+python test_kucoin_execution.py
 ```
 
-## Current Paper Rules
+## Current Strategy Rules
 
 - Universe is active KuCoin USDT perps with enabled KuCoin spot USDT pairs.
 - Entry uses funding benefit minus executable entry slippage, executable exit slippage, taker fees, and safety buffer.
@@ -133,3 +160,5 @@ python test_kucoin_basis_convergence_strategy.py
 - Funding accrues when a stored funding timestamp is crossed.
 - After funding is captured, the strategy checks whether the next funding event remains attractive.
 - Gentle unwind evaluates available partial-close chunks after exit slippage and estimated exit fees, then chooses the best net PnL percentage chunk.
+- Dry run gates simulated fills on fresh depth, borrow availability, exchange
+  precision, hedge mismatch, and acceptance of both non-matching test orders.
