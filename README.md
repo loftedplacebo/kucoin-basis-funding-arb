@@ -20,6 +20,9 @@ KuCoin precision and contract rules, checks margin borrow availability, and
 validates both hedge legs through non-matching `/test` endpoints. Authenticated
 POST requests to any non-test endpoint are refused in code. See
 [`docs/dry-run.md`](docs/dry-run.md) for the safety boundary and setup.
+The database, execution, leverage, liquidity, reconciliation, and account
+rebalancing work required before live trading is tracked in
+[`docs/live-next-steps.md`](docs/live-next-steps.md).
 
 ## Run Locally
 
