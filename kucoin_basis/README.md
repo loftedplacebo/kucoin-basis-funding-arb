@@ -90,14 +90,14 @@ Fixed modeled costs are:
 
 | Component | Allowance |
 | --- | ---: |
-| Spot entry taker fee | `0.10%` |
+| Spot entry taker fee | `0.08%` |
 | Perpetual entry taker fee | `0.06%` |
-| Combined exit fee | `0.16%` |
+| Combined exit fee | `0.14%` |
 | Safety buffer | `0.03%` |
-| Total before slippage | `0.35%` |
+| Total before slippage | `0.31%` |
 
 Therefore, absent special fee changes, the practical pre-depth funding benefit
-must be at least approximately `0.37%`. Four measured slippage components are
+must be at least approximately `0.33%`. Four measured slippage components are
 then subtracted as well.
 
 ### 2. Hedgeability gate

@@ -30,9 +30,9 @@ class KucoinBasisConfig:
     chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0, 1_000.0)
     max_chunk_notional_usd: float = 1_000.0
 
-    estimated_spot_taker_fee_pct: float = 0.10
+    estimated_spot_taker_fee_pct: float = 0.08
     estimated_perp_taker_fee_pct: float = 0.06
-    estimated_exit_fee_pct: float = 0.16
+    estimated_exit_fee_pct: float = 0.14
     safety_buffer_pct: float = 0.03
     max_entry_exit_cost_pct: float = 1.00
 
