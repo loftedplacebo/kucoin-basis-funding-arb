@@ -943,6 +943,7 @@ def _add_to_position(
     ) / new_notional
     position.next_funding_time = row.funding_time_utc or position.next_funding_time
     position.funding_interval_hours = row.funding_interval or position.funding_interval_hours
+    position.spot_hedge_route = position.spot_hedge_route or row.spot_hedge_route
     position.updated_at = utc_now()
     return position
 
@@ -1303,7 +1304,18 @@ def run_paper_strategy_once(
                 )
                 execution_result = execution_adapter.execute(
                     "EXIT",
-                    exit_row,
+                    replace(
+                        exit_row,
+                        spot_hedge_route=(
+                            position.spot_hedge_route
+                            or exit_row.spot_hedge_route
+                            or (
+                                "CROSS_MARGIN"
+                                if position.direction == "SHORT_SPOT_LONG_PERP"
+                                else "CASH_SPOT"
+                            )
+                        ),
+                    ),
                     exit_chunk,
                     target_base_quantity=target_base_quantity,
                 )
@@ -1482,6 +1494,15 @@ def run_paper_strategy_once(
                 execution_row = replace(
                     row,
                     notional_usd=execution_result.executable_notional_usd,
+                    spot_hedge_route=(
+                        "ISOLATED_MARGIN"
+                        if execution_result.spot_venue == "margin_isolated"
+                        else (
+                            "CROSS_MARGIN"
+                            if execution_result.spot_venue == "margin_cross"
+                            else row.spot_hedge_route
+                        )
+                    ),
                     spot_entry_avg_price=execution_result.spot_average_price,
                     perp_entry_avg_price=execution_result.perp_average_price,
                     spot_entry_slippage_pct=execution_result.spot_slippage_pct,
@@ -1567,6 +1588,7 @@ def run_paper_strategy_once(
                 next_funding_time=row.funding_time_utc,
                 funding_events_captured=0,
                 funding_interval_hours=row.funding_interval or config.fallback_funding_interval_hours,
+                spot_hedge_route=row.spot_hedge_route,
             )
             event_type = "OPEN_POSITION"
         positions[position.position_id] = position

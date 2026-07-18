@@ -145,6 +145,7 @@ class KucoinDryRunExecutor:
         self.public_client = public_client or KucoinPublicClient()
         self.max_hedge_mismatch_bps = max_hedge_mismatch_bps
         self._borrow_enabled: dict[str, bool] | None = None
+        self._isolated_borrow_enabled: dict[str, bool] = {}
 
     @classmethod
     def from_env_file(
@@ -166,6 +167,29 @@ class KucoinDryRunExecutor:
                 for item in account.get("accounts") or []
             }
         return self._borrow_enabled.get(currency, False)
+
+    def _isolated_margin_borrow_enabled(self, symbol: str) -> bool:
+        if symbol not in self._isolated_borrow_enabled:
+            account = self.private_client.get_isolated_margin_account(symbol)
+            enabled = False
+            for item in account.get("assets") or []:
+                if str(item.get("symbol", "")) != symbol:
+                    continue
+                base_asset = item.get("baseAsset") or {}
+                enabled = base_asset.get("borrowEnabled") is True
+                break
+            self._isolated_borrow_enabled[symbol] = enabled
+        return self._isolated_borrow_enabled[symbol]
+
+    def _margin_route(self, row: OpportunityRow) -> str:
+        route = row.spot_hedge_route or "CROSS_MARGIN"
+        if route not in {
+            "CROSS_MARGIN",
+            "ISOLATED_MARGIN",
+            "CROSS_OR_ISOLATED",
+        }:
+            raise KucoinSafetyError(f"Unsupported short-spot hedge route: {route}")
+        return route
 
     def _rejected(
         self,
@@ -220,10 +244,31 @@ class KucoinDryRunExecutor:
         if notional_usd <= 0:
             raise ValueError("notional must be positive")
         spot_venue, spot_side, perp_side = _sides(row.direction, action)
-        if spot_venue == "margin" and action == "ENTRY" and not self._margin_borrow_enabled(row.base):
-            return self._rejected(
-                action, row, notional_usd, "spot_margin_borrow_not_enabled"
-            )
+        isolated_margin = False
+        if spot_venue == "margin":
+            margin_route = self._margin_route(row)
+            if margin_route == "CROSS_OR_ISOLATED":
+                margin_route = (
+                    "CROSS_MARGIN"
+                    if self._margin_borrow_enabled(row.base)
+                    else "ISOLATED_MARGIN"
+                )
+            isolated_margin = margin_route == "ISOLATED_MARGIN"
+            spot_venue = "margin_isolated" if isolated_margin else "margin_cross"
+            if action == "ENTRY":
+                borrow_enabled = (
+                    self._isolated_margin_borrow_enabled(row.spot_symbol)
+                    if isolated_margin
+                    else self._margin_borrow_enabled(row.base)
+                )
+                if not borrow_enabled:
+                    return self._rejected(
+                        action,
+                        row,
+                        notional_usd,
+                        "spot_margin_borrow_not_enabled",
+                        spot_venue=spot_venue,
+                    )
 
         standard_symbol = f"{row.base}USDT"
         spot_book = self.public_client.get_spot_orderbook(
@@ -311,10 +356,10 @@ class KucoinDryRunExecutor:
             "size": _decimal_string(spot_size),
             "timeInForce": "IOC",
         }
-        if spot_venue == "margin":
+        if spot_venue in {"margin_cross", "margin_isolated"}:
             spot_payload.update(
                 {
-                    "isIsolated": False,
+                    "isIsolated": isolated_margin,
                     "autoBorrow": action == "ENTRY",
                     "autoRepay": action == "EXIT",
                 }

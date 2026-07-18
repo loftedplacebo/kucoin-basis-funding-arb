@@ -166,6 +166,18 @@ class KucoinPrivateClient:
             params={"quoteCurrency": "USDT", "queryType": "MARGIN"},
         ) or {}
 
+    def get_isolated_margin_account(self, symbol: str) -> dict:
+        return self._request(
+            "GET",
+            self.credentials.spot_url,
+            "/api/v3/isolated/accounts",
+            params={
+                "symbol": symbol,
+                "quoteCurrency": "USDT",
+                "queryType": "ISOLATED",
+            },
+        ) or {}
+
     def get_futures_account(self, currency: str = "USDT") -> dict:
         return self._request(
             "GET",

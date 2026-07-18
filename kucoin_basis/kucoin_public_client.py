@@ -41,6 +41,8 @@ class KucoinPublicClient:
         self._last_request_at: float | None = None
         self._spot_symbols: tuple[float, list[dict]] | None = None
         self._active_contracts: tuple[float, list[dict]] | None = None
+        self._cross_margin_symbols: tuple[float, list[dict]] | None = None
+        self._isolated_margin_symbols: tuple[float, list[dict]] | None = None
         self._spot_symbol_cache: dict[str, dict] = {}
         self._contract_cache: dict[str, dict] = {}
 
@@ -117,6 +119,28 @@ class KucoinPublicClient:
             if symbol:
                 self._contract_cache[symbol] = contract
         return contracts
+
+    def get_cross_margin_symbols(self) -> list[dict]:
+        cached = self._cached(
+            self._cross_margin_symbols, self.spot_symbols_cache_seconds
+        )
+        if cached is not None:
+            return cached
+        data = self._get(SPOT_BASE_URL, "/api/v3/margin/symbols")
+        symbols = data if isinstance(data, list) else []
+        self._cross_margin_symbols = (self._monotonic(), symbols)
+        return symbols
+
+    def get_isolated_margin_symbols(self) -> list[dict]:
+        cached = self._cached(
+            self._isolated_margin_symbols, self.spot_symbols_cache_seconds
+        )
+        if cached is not None:
+            return cached
+        data = self._get(SPOT_BASE_URL, "/api/v1/isolated/symbols")
+        symbols = data if isinstance(data, list) else []
+        self._isolated_margin_symbols = (self._monotonic(), symbols)
+        return symbols
 
     def get_spot_symbol(self, exchange_symbol: str) -> dict:
         cached = self._spot_symbol_cache.get(exchange_symbol)

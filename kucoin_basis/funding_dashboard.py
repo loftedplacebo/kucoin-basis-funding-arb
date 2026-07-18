@@ -238,6 +238,9 @@ HTML = """<!doctype html>
     .decision-cell.reject {
       color: var(--bad);
     }
+    .decision-cell.unhedgeable {
+      color: #9a5b00;
+    }
     .positive { color: var(--good); font-weight: 650; }
     .negative { color: var(--bad); font-weight: 650; }
     .muted { color: var(--muted); }
@@ -277,6 +280,29 @@ HTML = """<!doctype html>
     @media (max-width: 720px) {
       header, main { padding-left: 14px; padding-right: 14px; }
       input { min-width: 100%; }
+      #shortlistSection th:nth-child(7),
+      #shortlistSection td:nth-child(7),
+      #shortlistSection th:nth-child(8),
+      #shortlistSection td:nth-child(8),
+      #shortlistSection th:nth-child(9),
+      #shortlistSection td:nth-child(9),
+      #shortlistSection th:nth-child(10),
+      #shortlistSection td:nth-child(10),
+      #shortlistSection th:nth-child(11),
+      #shortlistSection td:nth-child(11),
+      #shortlistSection th:last-child,
+      #shortlistSection td:last-child {
+        display: none;
+      }
+      #shortlistSection th:nth-child(1),
+      #shortlistSection td:nth-child(1) { width: 12%; }
+      #shortlistSection th:nth-child(2),
+      #shortlistSection td:nth-child(2) { width: 25%; }
+      #shortlistSection th,
+      #shortlistSection td {
+        overflow-wrap: normal;
+        word-break: normal;
+      }
     }
   </style>
 </head>
@@ -333,6 +359,9 @@ HTML = """<!doctype html>
         <button class="direction-filter active" data-direction="ALL">All directions</button>
         <button class="direction-filter" data-direction="LONG_SPOT_SHORT_PERP">Long spot / short perp</button>
         <button class="direction-filter" data-direction="SHORT_SPOT_LONG_PERP">Short spot / long perp</button>
+        <button class="eligibility-filter active" data-eligibility="ALL">All statuses</button>
+        <button class="eligibility-filter" data-eligibility="ACTIONABLE">Actionable</button>
+        <button class="eligibility-filter" data-eligibility="UNHEDGEABLE">Unhedgeable</button>
         <input id="shortlistFilter" placeholder="Search symbol or reason" autocomplete="off">
         <button id="toggleChunks">Show chunks</button>
       </div>
@@ -347,6 +376,7 @@ HTML = """<!doctype html>
             <tr>
               <th>Base</th>
               <th>Dir</th>
+              <th title="Cash spot needs no borrow; margin routes are rechecked before execution.">Hedge</th>
               <th class="chunk-cell">Notional</th>
               <th>Funding</th>
               <th>Edge</th>
@@ -443,6 +473,7 @@ HTML = """<!doctype html>
     let sortMode = "fundingDesc";
     let activeTab = "funding";
     let shortlistDirection = "ALL";
+    let shortlistEligibility = "ALL";
     let shortlistShowChunks = false;
 
     const rowsEl = document.getElementById("rows");
@@ -566,14 +597,26 @@ HTML = """<!doctype html>
         basis_too_volatile_no_add: "basis adverse: no add",
         volatility_cooldown: "cooldown",
         no_fresh_market_row: "no fresh market row",
+        spot_borrow_unavailable: "no KuCoin margin borrow",
+        spot_borrow_status_unavailable: "borrow status unavailable",
       };
       return labels[value] || value || "";
     }
 
     function decisionClass(value) {
       if (value === "ENTER_CANDIDATE") return "enter";
+      if (value === "UNHEDGEABLE") return "unhedgeable";
       if (value === "REJECT") return "reject";
       return "";
+    }
+
+    function displayHedgeRoute(value) {
+      if (value === "CASH_SPOT") return "Cash";
+      if (value === "CROSS_MARGIN") return "Cross";
+      if (value === "ISOLATED_MARGIN") return "Isolated";
+      if (value === "CROSS_OR_ISOLATED") return "Cross/isolated";
+      if (value === "NONE") return "None";
+      return value || "";
     }
 
     function minutesToFunding(item) {
@@ -642,11 +685,16 @@ HTML = """<!doctype html>
       const visibleItems = sourceItems.filter((item) => {
         const directionMatches = shortlistDirection === "ALL" || item.direction === shortlistDirection;
         if (!directionMatches) return false;
+        const eligibilityMatches = shortlistEligibility === "ALL"
+          || (shortlistEligibility === "ACTIONABLE" && item.decision === "ENTER_CANDIDATE")
+          || (shortlistEligibility === "UNHEDGEABLE" && item.decision === "UNHEDGEABLE");
+        if (!eligibilityMatches) return false;
         if (!filter) return true;
         return item.base.includes(filter)
           || item.direction.includes(filter)
           || item.spotSymbol.includes(filter)
           || item.perpSymbol.includes(filter)
+          || item.spotHedgeRoute.includes(filter)
           || item.decision.includes(filter)
           || item.reason.includes(filter);
       });
@@ -656,6 +704,7 @@ HTML = """<!doctype html>
         tr.innerHTML = `
           <td><strong>${item.base}</strong></td>
           <td>${displayDirection(item.direction)}</td>
+          <td>${displayHedgeRoute(item.spotHedgeRoute)}</td>
           <td class="chunk-cell">${fmtMoney(item.notionalUsd)}</td>
           <td class="${item.fundingBenefitPct >= 0 ? "positive" : "negative"}">${fmtPct(item.fundingBenefitPct)}</td>
           <td class="edge-cell ${edgeClass}">${fmtPct(item.expectedEdgePct)}</td>
@@ -664,7 +713,7 @@ HTML = """<!doctype html>
           <td>${fmt(item.minutesToFunding, 1)}</td>
           <td>${fmtPct(item.basisPct)}</td>
           <td>${item.roundTripFillable ? "yes" : "no"}</td>
-          <td class="decision-cell ${decisionClass(item.decision)}">${item.decision === "ENTER_CANDIDATE" ? "ENTER" : item.decision}</td>
+          <td class="decision-cell ${decisionClass(item.decision)}">${item.decision === "ENTER_CANDIDATE" ? "ENTER" : item.decision === "UNHEDGEABLE" ? "NO HEDGE" : item.decision}</td>
           <td title="${item.reason}">${displayReason(item.reason)}</td>
         `;
         shortlistRowsEl.appendChild(tr);
@@ -672,15 +721,19 @@ HTML = """<!doctype html>
       document.querySelectorAll(".direction-filter").forEach((button) => {
         button.classList.toggle("active", button.dataset.direction === shortlistDirection);
       });
+      document.querySelectorAll(".eligibility-filter").forEach((button) => {
+        button.classList.toggle("active", button.dataset.eligibility === shortlistEligibility);
+      });
       updateShortlistStatus(visibleItems.length, sourceItems.length);
     }
 
     function updateShortlistStatus(visibleCount, sourceCount) {
       const directionText = shortlistDirection === "ALL" ? "all directions" : shortlistDirection;
+      const eligibilityText = shortlistEligibility === "ALL" ? "all statuses" : shortlistEligibility.toLowerCase();
       const filter = shortlistFilterEl.value.trim();
       const modeText = shortlistShowChunks ? "chunk rows" : "symbol/direction rows";
       const filterText = filter ? ` matching "${filter}"` : "";
-      statusEl.textContent = `${visibleCount} of ${sourceCount} ${modeText}${filterText} (${directionText}); ${shortlistRawRowCount || shortlistRawItems.length} raw chunk rows loaded`;
+      statusEl.textContent = `${visibleCount} of ${sourceCount} ${modeText}${filterText} (${directionText}, ${eligibilityText}); ${shortlistRawRowCount || shortlistRawItems.length} raw chunk rows loaded`;
     }
 
     function renderPositions() {
@@ -760,6 +813,7 @@ HTML = """<!doctype html>
         ["Active cooldowns", summaryPayload.activeCooldowns],
         ["Shortlist rows", summaryPayload.shortlistRows],
         ["Entry candidates", summaryPayload.entryCandidates],
+        ["Unhedgeable rows", summaryPayload.unhedgeableRows],
       ];
       summaryMetricsEl.innerHTML = "";
       for (const [label, value] of metrics) {
@@ -885,6 +939,12 @@ HTML = """<!doctype html>
     document.querySelectorAll(".direction-filter").forEach((button) => {
       button.addEventListener("click", () => {
         shortlistDirection = button.dataset.direction;
+        renderShortlist();
+      });
+    });
+    document.querySelectorAll(".eligibility-filter").forEach((button) => {
+      button.addEventListener("click", () => {
+        shortlistEligibility = button.dataset.eligibility;
         renderShortlist();
       });
     });
@@ -1258,8 +1318,12 @@ def _shortlist_display_rows(rows: list[dict]) -> list[dict]:
         key = (row.get("base", ""), row.get("direction", ""))
         expected_edge = parse_float(row.get("expected_edge_pct"), -999) or -999
         scenario_edge = parse_float(row.get("scenario_edge_pct"), expected_edge) or expected_edge
+        decision_rank = {
+            "ENTER_CANDIDATE": 2,
+            "UNHEDGEABLE": 1,
+        }.get(row.get("decision"), 0)
         rank = (
-            row.get("decision") == "ENTER_CANDIDATE",
+            decision_rank,
             expected_edge,
             scenario_edge,
             -(parse_float(row.get("notional_usd"), 0.0) or 0.0),
@@ -1270,7 +1334,10 @@ def _shortlist_display_rows(rows: list[dict]) -> list[dict]:
     display_rows = [value[1] for value in best_by_symbol_direction.values()]
     display_rows.sort(
         key=lambda row: (
-            row.get("decision") == "ENTER_CANDIDATE",
+            {
+                "ENTER_CANDIDATE": 2,
+                "UNHEDGEABLE": 1,
+            }.get(row.get("decision"), 0),
             parse_float(row.get("expected_edge_pct"), -999) or -999,
         ),
         reverse=True,
@@ -1333,6 +1400,7 @@ def _shortlist_item_from_row(row: dict, config: KucoinBasisConfig) -> dict:
         "timestampUtc": row.get("timestamp_utc", ""),
         "base": row.get("base", ""),
         "direction": row.get("direction", ""),
+        "spotHedgeRoute": row.get("spot_hedge_route", ""),
         "spotSymbol": row.get("spot_symbol", ""),
         "perpSymbol": row.get("perp_symbol", ""),
         "notionalUsd": parse_float(row.get("notional_usd"), 0.0) or 0.0,
@@ -1638,6 +1706,9 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
         "activeCooldowns": len(active_cooldowns),
         "shortlistRows": len(latest_rows),
         "entryCandidates": sum(1 for row in latest_rows if row.get("decision") == "ENTER_CANDIDATE"),
+        "unhedgeableRows": sum(
+            1 for row in latest_rows if row.get("decision") == "UNHEDGEABLE"
+        ),
         "entryRejections": entry_rejections.most_common(10),
         "exitReasons": exit_reasons.most_common(10),
         "alerts": _dashboard_alerts(positions, fills, decisions, now),

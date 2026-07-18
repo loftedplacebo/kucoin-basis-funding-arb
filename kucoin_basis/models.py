@@ -102,6 +102,7 @@ class OpportunityRow:
     round_trip_fillable: bool
     decision: str
     reason: str
+    spot_hedge_route: str = ""
     spot_entry_avg_price: Optional[float] = None
     perp_entry_avg_price: Optional[float] = None
     spot_exit_avg_price: Optional[float] = None
@@ -158,6 +159,7 @@ class OpportunityRow:
             round_trip_fillable=parse_bool(row.get("round_trip_fillable")),
             decision=str(row.get("decision", "")).strip(),
             reason=str(row.get("reason", "")).strip(),
+            spot_hedge_route=str(row.get("spot_hedge_route", "")).strip(),
             spot_entry_avg_price=parse_float(row.get("spot_entry_avg_price")),
             perp_entry_avg_price=parse_float(row.get("perp_entry_avg_price")),
             spot_exit_avg_price=parse_float(row.get("spot_exit_avg_price")),

@@ -18,6 +18,7 @@ OPPORTUNITY_FIELDS = [
     "timestamp_utc",
     "base",
     "direction",
+    "spot_hedge_route",
     "spot_symbol",
     "perp_symbol",
     "funding_rate_pct",
@@ -122,9 +123,15 @@ def _decision_for_row(
     basis_observation_count: int,
     basis_percentile: float | None,
     exit_cost_pct: float | None,
+    spot_hedge_route: str = "CROSS_MARGIN",
 ) -> tuple[str, str]:
     if config.approved_bases and pair.base not in config.approved_bases:
         return "REJECT", "base_not_whitelisted"
+    if direction == "SHORT_SPOT_LONG_PERP":
+        if spot_hedge_route == "NONE":
+            return "UNHEDGEABLE", "spot_borrow_unavailable"
+        if spot_hedge_route == "UNKNOWN":
+            return "REJECT", "spot_borrow_status_unavailable"
     if funding_benefit_pct is None:
         return "REJECT", "funding_rate_missing"
     if funding_benefit_pct < config.min_funding_rate_pct:
@@ -215,6 +222,43 @@ def _open_position_watchlist(config: KucoinBasisConfig) -> dict[str, dict[str, s
     return watchlist
 
 
+def _spot_hedge_routes(client: KucoinPublicClient) -> dict[str, str]:
+    cross_bases = {
+        str(item.get("baseCurrency", "")).upper()
+        for item in client.get_cross_margin_symbols()
+        if item.get("quoteCurrency") == "USDT"
+        and str(item.get("enableTrading", "true")).lower() != "false"
+    }
+    isolated_bases = {
+        str(item.get("baseCurrency", "")).upper()
+        for item in client.get_isolated_margin_symbols()
+        if item.get("quoteCurrency") == "USDT"
+        and item.get("tradeEnable") is True
+        and item.get("baseBorrowEnable") is True
+    }
+    routes = {}
+    for base in cross_bases | isolated_bases:
+        if base in cross_bases and base in isolated_bases:
+            routes[base] = "CROSS_OR_ISOLATED"
+        elif base in cross_bases:
+            routes[base] = "CROSS_MARGIN"
+        else:
+            routes[base] = "ISOLATED_MARGIN"
+    return routes
+
+
+def _spot_hedge_route(
+    direction: str,
+    base: str,
+    routes: dict[str, str] | None,
+) -> str:
+    if direction == "LONG_SPOT_SHORT_PERP":
+        return "CASH_SPOT"
+    if routes is None:
+        return "CROSS_MARGIN"
+    return routes.get(base, "NONE")
+
+
 def _shortlist_directions(
     *,
     config: KucoinBasisConfig,
@@ -241,6 +285,7 @@ def scan_pair(
     contracts_by_symbol: dict[str, dict],
     now: datetime,
     watchlist: dict[str, dict[str, set[float]]] | None = None,
+    spot_hedge_routes: dict[str, str] | None = None,
 ) -> list[OpportunityRow]:
     # Use the bulk contract feed only to identify symbols worth inspecting. Any
     # symbol that can enter or is already open is then verified atomically.
@@ -319,6 +364,9 @@ def scan_pair(
         if notional <= 0:
             continue
         for direction in directions:
+            spot_hedge_route = _spot_hedge_route(
+                direction, pair.base, spot_hedge_routes
+            )
             is_entry_chunk = notional in config.chunk_ladder_usd and notional <= config.max_chunk_notional_usd
             is_entry_direction = direction in shortlisted_directions
             is_watch_row = direction in watched_by_direction and notional in watched_by_direction[direction]
@@ -369,6 +417,7 @@ def scan_pair(
                     basis_observation_count=basis_stats.observation_count,
                     basis_percentile=basis_stats.percentile,
                     exit_cost_pct=exit_cost_pct,
+                    spot_hedge_route=spot_hedge_route,
                 )
             else:
                 decision, reason = "REJECT", "open_position_watchlist"
@@ -377,6 +426,7 @@ def scan_pair(
                     timestamp_utc=now,
                     base=pair.base,
                     direction=direction,
+                    spot_hedge_route=spot_hedge_route,
                     spot_symbol=pair.spot_symbol,
                     perp_symbol=pair.perp_symbol,
                     funding_rate_pct=funding.funding_rate_pct,
@@ -430,15 +480,33 @@ def scan_once(
     config.archive_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(timezone.utc)
+    errors: list[str] = []
     contracts = _contracts_by_symbol(client)
     pairs = discover_symbol_pairs(client, config)
     watchlist = _open_position_watchlist(config)
+    try:
+        spot_hedge_routes = _spot_hedge_routes(client)
+    except Exception as exc:
+        spot_hedge_routes = {
+            pair.base: "UNKNOWN"
+            for pair in pairs
+        }
+        errors.append(f"margin support: {exc}")
     rows: list[OpportunityRow] = []
-    errors: list[str] = []
 
     for pair in pairs:
         try:
-            rows.extend(scan_pair(client, config, pair, contracts, now, watchlist))
+            rows.extend(
+                scan_pair(
+                    client,
+                    config,
+                    pair,
+                    contracts,
+                    now,
+                    watchlist,
+                    spot_hedge_routes,
+                )
+            )
         except Exception as exc:
             errors.append(f"{pair.base}: {exc}")
 

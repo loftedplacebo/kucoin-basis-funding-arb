@@ -61,7 +61,9 @@ For each relevant pair, the scanner:
 4. Prices spot entry, perpetual entry, spot exit, and perpetual exit for each
    configured entry chunk and every open-position watch notional.
 5. Appends midpoint basis history and calculates rolling statistics.
-6. Writes a decision and reason for every tested row.
+6. Classifies the spot hedge as cash, cross margin, isolated margin, or
+   unavailable.
+7. Writes a decision and reason for every tested row.
 
 Open positions remain on the scanner watchlist even when funding no longer
 qualifies for a new entry. This supplies current exit rows for held positions.
@@ -98,7 +100,17 @@ Therefore, absent special fee changes, the practical pre-depth funding benefit
 must be at least approximately `0.37%`. Four measured slippage components are
 then subtracted as well.
 
-### 2. Depth and expected-edge gate
+### 2. Hedgeability gate
+
+- `LONG_SPOT_SHORT_PERP` uses owned cash spot and does not require base-asset
+  borrowing.
+- `SHORT_SPOT_LONG_PERP` requires either an enabled KuCoin cross-margin pair or
+  an isolated-margin pair with base borrowing enabled.
+- Rows without either route remain visible as `UNHEDGEABLE` but cannot enter.
+- Cross and isolated borrow availability is rechecked through the authenticated
+  account immediately before a dry-run test order.
+
+### 3. Depth and expected-edge gate
 
 - All four round-trip legs must be fillable for the tested notional.
 - Expected edge after four slippage components and all modeled costs must be at
@@ -107,7 +119,7 @@ then subtracted as well.
 - The strategy processes only the newest scanner timestamp.
 - A row older than 180 seconds is stale and cannot activate an entry or exit.
 
-### 3. Basis percentile gate
+### 4. Basis percentile gate
 
 The latest 15 midpoint basis observations are retained. Once five observations
 exist:
@@ -271,8 +283,9 @@ root and is not part of these funding-harvest rules.
 
 ## Dry Run And Live Limitations
 
-- Paper mode does not check authenticated account state. Dry run checks whether
-  the short-spot base is borrow-enabled, but it does not create a loan.
+- Paper mode uses KuCoin's public cross/isolated margin catalogues. Dry run also
+  checks account-level borrowing and selects the matching cross or isolated
+  test-order route, but it does not create a loan.
 - Borrow cost, recalls, margin liquidation, account-specific fee tier, and
   actual balance reservation are not included in PnL.
 - Dry run applies current order precision, minimum size, contract multiplier,

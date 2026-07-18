@@ -33,6 +33,7 @@ class PaperPosition:
     funding_events_captured: int
     funding_interval_hours: Optional[float] = None
     adverse_funding_since: Optional[datetime] = None
+    spot_hedge_route: str = ""
     status: str = "OPEN"
 
     def to_csv_row(self) -> dict:
@@ -70,5 +71,6 @@ class PaperPosition:
             funding_interval_hours=parse_float(row.get("funding_interval_hours")),
             funding_events_captured=parse_int(row.get("funding_events_captured")),
             adverse_funding_since=parse_datetime(row.get("adverse_funding_since")),
+            spot_hedge_route=str(row.get("spot_hedge_route", "")),
             status=str(row.get("status", "OPEN")),
         )

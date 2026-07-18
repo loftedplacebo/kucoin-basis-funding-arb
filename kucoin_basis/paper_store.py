@@ -33,6 +33,7 @@ POSITION_FIELDS = [
     "funding_events_captured",
     "funding_interval_hours",
     "adverse_funding_since",
+    "spot_hedge_route",
     "status",
 ]
 

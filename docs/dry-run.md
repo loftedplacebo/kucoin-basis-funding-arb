@@ -69,7 +69,8 @@ Before a strategy-approved fill reaches the dry-run ledger, the adapter:
    current exchange metadata.
 4. Builds equal-base-quantity hedge legs and enforces a maximum quantity
    mismatch of 25 basis points.
-5. Checks margin borrow availability before a short-spot entry.
+5. Checks the scanner-selected cross or isolated margin route and confirms
+   account-level base borrowing before a short-spot entry.
 6. Builds marketable IOC limit orders at the worst consumed book price.
 7. Validates both legs through KuCoin's Spot/Margin and Futures `/test`
    endpoints.

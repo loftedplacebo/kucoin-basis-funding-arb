@@ -297,6 +297,48 @@ def test_post_funding_rollover_quarantine_blocks_entry():
     assert reason == "post_funding_rollover_quarantine"
 
 
+def test_short_spot_without_margin_route_is_unhedgeable():
+    decision, reason = _decision_for_row(
+        pair=SymbolPair(base="HOME", spot_symbol="HOME-USDT", perp_symbol="HOMEUSDTM"),
+        config=KucoinBasisConfig(),
+        direction="SHORT_SPOT_LONG_PERP",
+        funding_benefit_pct=1.0,
+        minutes_to_funding=60.0,
+        funding_interval_hours=8.0,
+        funding_cycle_confirmed=True,
+        expected_edge_pct=0.5,
+        round_trip_fillable=True,
+        basis_observation_count=0,
+        basis_percentile=None,
+        exit_cost_pct=0.1,
+        spot_hedge_route="NONE",
+    )
+
+    assert decision == "UNHEDGEABLE"
+    assert reason == "spot_borrow_unavailable"
+
+
+def test_long_spot_does_not_require_margin_route():
+    decision, reason = _decision_for_row(
+        pair=SymbolPair(base="HOME", spot_symbol="HOME-USDT", perp_symbol="HOMEUSDTM"),
+        config=KucoinBasisConfig(),
+        direction="LONG_SPOT_SHORT_PERP",
+        funding_benefit_pct=1.0,
+        minutes_to_funding=60.0,
+        funding_interval_hours=8.0,
+        funding_cycle_confirmed=True,
+        expected_edge_pct=0.5,
+        round_trip_fillable=True,
+        basis_observation_count=0,
+        basis_percentile=None,
+        exit_cost_pct=0.1,
+        spot_hedge_route="CASH_SPOT",
+    )
+
+    assert decision == "ENTER_CANDIDATE"
+    assert reason == "entry_rules_passed"
+
+
 def test_new_funding_cycle_requires_two_observations():
     _FUNDING_CYCLE_OBSERVATIONS.clear()
     funding_time = datetime(2026, 7, 13, 0, 0, tzinfo=timezone.utc)
@@ -1808,6 +1850,8 @@ if __name__ == "__main__":
     test_funding_accrues_without_current_opportunity_row()
     test_funding_snapshot_uses_atomic_current_response_not_stale_contract_rate()
     test_post_funding_rollover_quarantine_blocks_entry()
+    test_short_spot_without_margin_route_is_unhedgeable()
+    test_long_spot_does_not_require_margin_route()
     test_new_funding_cycle_requires_two_observations()
     test_funding_accrual_uses_exact_settlement_not_current_cycle_rate()
     test_missing_settlement_history_keeps_funding_pending_for_retry()

@@ -22,9 +22,18 @@ from test_kucoin_basis_strategy import (
 
 
 class FakePrivateClient:
-    def __init__(self, borrow_enabled: bool = True):
+    def __init__(
+        self,
+        borrow_enabled: bool = True,
+        isolated_borrow_enabled: bool | None = None,
+    ):
         self.credentials = SimpleNamespace(execution_mode="validate")
         self.borrow_enabled = borrow_enabled
+        self.isolated_borrow_enabled = (
+            borrow_enabled
+            if isolated_borrow_enabled is None
+            else isolated_borrow_enabled
+        )
         self.spot_orders = []
         self.margin_orders = []
         self.futures_orders = []
@@ -33,6 +42,18 @@ class FakePrivateClient:
         return {
             "accounts": [
                 {"currency": "MIRA", "borrowEnabled": self.borrow_enabled}
+            ]
+        }
+
+    def get_isolated_margin_account(self, symbol):
+        return {
+            "assets": [
+                {
+                    "symbol": symbol,
+                    "baseAsset": {
+                        "borrowEnabled": self.isolated_borrow_enabled,
+                    },
+                }
             ]
         }
 
@@ -117,7 +138,7 @@ def test_short_spot_entry_validates_auto_borrow_and_long_perp():
     result = executor.execute("ENTRY", row, 100.0)
 
     assert result.accepted
-    assert result.spot_venue == "margin"
+    assert result.spot_venue == "margin_cross"
     assert result.perp_contracts == 9
     assert result.spot_size == result.perp_base_quantity
     assert result.hedge_mismatch_bps == 0
@@ -187,6 +208,40 @@ def test_short_spot_entry_rejects_when_base_cannot_be_borrowed():
     assert result.reason == "spot_margin_borrow_not_enabled"
     assert not private.margin_orders
     assert not private.futures_orders
+
+
+def test_isolated_short_spot_entry_uses_isolated_auto_borrow():
+    private = FakePrivateClient()
+    executor = KucoinDryRunExecutor(private, FakePublicClient())
+    row = replace_row(
+        make_row(100.0, 0.01, 0.01),
+        spot_hedge_route="ISOLATED_MARGIN",
+    )
+
+    result = executor.execute("ENTRY", row, 100.0)
+
+    assert result.accepted
+    assert result.spot_venue == "margin_isolated"
+    assert private.margin_orders[0]["isIsolated"] is True
+    assert private.margin_orders[0]["autoBorrow"] is True
+
+
+def test_combined_margin_route_falls_back_to_isolated():
+    private = FakePrivateClient(
+        borrow_enabled=False,
+        isolated_borrow_enabled=True,
+    )
+    executor = KucoinDryRunExecutor(private, FakePublicClient())
+    row = replace_row(
+        make_row(100.0, 0.01, 0.01),
+        spot_hedge_route="CROSS_OR_ISOLATED",
+    )
+
+    result = executor.execute("ENTRY", row, 100.0)
+
+    assert result.accepted
+    assert result.spot_venue == "margin_isolated"
+    assert private.margin_orders[0]["isIsolated"] is True
 
 
 def test_private_client_refuses_every_non_test_post():
@@ -288,6 +343,8 @@ if __name__ == "__main__":
     test_exit_uses_stored_base_quantity_instead_of_recalculating_from_notional()
     test_long_spot_entry_uses_spot_account_and_short_perp()
     test_short_spot_entry_rejects_when_base_cannot_be_borrowed()
+    test_isolated_short_spot_entry_uses_isolated_auto_borrow()
+    test_combined_margin_route_falls_back_to_isolated()
     test_private_client_refuses_every_non_test_post()
     test_futures_orderbook_contract_sizes_are_converted_to_base_quantity()
     test_strategy_rejected_preflight_cannot_create_paper_fill()

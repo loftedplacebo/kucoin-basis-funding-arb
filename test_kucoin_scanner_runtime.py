@@ -3,6 +3,7 @@ from pathlib import Path
 import requests
 
 from kucoin_basis.kucoin_public_client import KucoinPublicClient
+from kucoin_basis.opportunity_scanner import _spot_hedge_routes
 from kucoin_basis.run_scanner import config_for_state_mode
 
 
@@ -85,6 +86,65 @@ def test_public_client_caches_catalog_calls():
     assert len(session.calls) == 2
 
 
+def test_public_client_caches_margin_catalogs():
+    clock = FakeClock()
+    session = FakeSession(
+        [
+            FakeResponse(200, {"code": "200000", "data": [{"symbol": "BTC-USDT"}]}),
+            FakeResponse(200, {"code": "200000", "data": [{"symbol": "ETH-USDT"}]}),
+        ]
+    )
+    client = KucoinPublicClient(
+        session=session,
+        min_request_interval_seconds=0,
+        sleep=clock.sleep,
+        monotonic=clock.monotonic,
+    )
+
+    assert client.get_cross_margin_symbols() == client.get_cross_margin_symbols()
+    assert client.get_isolated_margin_symbols() == client.get_isolated_margin_symbols()
+    assert len(session.calls) == 2
+
+
+def test_margin_route_prefers_cross_then_isolated():
+    class MarginCatalogClient:
+        def get_cross_margin_symbols(self):
+            return [
+                {
+                    "baseCurrency": "BTC",
+                    "quoteCurrency": "USDT",
+                    "enableTrading": True,
+                }
+            ]
+
+        def get_isolated_margin_symbols(self):
+            return [
+                {
+                    "baseCurrency": "BTC",
+                    "quoteCurrency": "USDT",
+                    "tradeEnable": True,
+                    "baseBorrowEnable": True,
+                },
+                {
+                    "baseCurrency": "MIRA",
+                    "quoteCurrency": "USDT",
+                    "tradeEnable": True,
+                    "baseBorrowEnable": True,
+                },
+                {
+                    "baseCurrency": "KCS",
+                    "quoteCurrency": "USDT",
+                    "tradeEnable": True,
+                    "baseBorrowEnable": False,
+                },
+            ]
+
+    assert _spot_hedge_routes(MarginCatalogClient()) == {
+        "BTC": "CROSS_OR_ISOLATED",
+        "MIRA": "ISOLATED_MARGIN",
+    }
+
+
 def test_rate_limit_exhaustion_does_not_double_load_funding_endpoints():
     clock = FakeClock()
     session = FakeSession([FakeResponse(429, {}) for _ in range(4)])
@@ -118,6 +178,8 @@ def test_dry_run_scanner_uses_dry_run_position_ledger():
 if __name__ == "__main__":
     test_public_client_retries_429_using_retry_after()
     test_public_client_caches_catalog_calls()
+    test_public_client_caches_margin_catalogs()
+    test_margin_route_prefers_cross_then_isolated()
     test_rate_limit_exhaustion_does_not_double_load_funding_endpoints()
     test_dry_run_scanner_uses_dry_run_position_ledger()
     print("kucoin scanner runtime tests passed")
