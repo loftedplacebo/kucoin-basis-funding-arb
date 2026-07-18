@@ -108,6 +108,33 @@ COOLDOWN_FIELDS = [
     "expires_at_utc",
 ]
 
+EXECUTION_ATTEMPT_FIELDS = [
+    "timestamp_utc",
+    "mode",
+    "action",
+    "base",
+    "direction",
+    "requested_notional_usd",
+    "executable_notional_usd",
+    "accepted",
+    "reason",
+    "spot_venue",
+    "spot_side",
+    "spot_size",
+    "spot_average_price",
+    "spot_limit_price",
+    "spot_slippage_pct",
+    "perp_side",
+    "perp_contracts",
+    "perp_base_quantity",
+    "perp_average_price",
+    "perp_limit_price",
+    "perp_slippage_pct",
+    "hedge_mismatch_bps",
+    "spot_test_accepted",
+    "perp_test_accepted",
+]
+
 
 class PaperStore:
     def __init__(self, config: KucoinBasisConfig):
@@ -120,6 +147,7 @@ class PaperStore:
         self.decisions_path = self.data_dir / "decisions.csv"
         self.processed_opportunities_path = self.data_dir / "processed_opportunities.csv"
         self.cooldowns_path = self.data_dir / "cooldowns.csv"
+        self.execution_attempts_path = self.data_dir / "execution_attempts.csv"
 
     def load_all_positions(self) -> list[PaperPosition]:
         if not self.positions_path.exists():
@@ -157,6 +185,13 @@ class PaperStore:
 
     def append_cooldown(self, row: dict) -> None:
         self._append_row(self.cooldowns_path, COOLDOWN_FIELDS, row)
+
+    def append_execution_attempt(self, row: dict) -> None:
+        self._append_row(
+            self.execution_attempts_path,
+            EXECUTION_ATTEMPT_FIELDS,
+            row,
+        )
 
     def load_active_cooldowns(self, now=None) -> dict[tuple[str, str], dict]:
         now = now or utc_now()

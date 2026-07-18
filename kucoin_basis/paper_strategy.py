@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import csv
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from kucoin_basis.config import DEFAULT_CONFIG, KucoinBasisConfig
+from kucoin_basis.execution import ExecutionAdapter
 from kucoin_basis.funding import fetch_funding_settlements
 from kucoin_basis.kucoin_public_client import KucoinPublicClient
 from kucoin_basis.models import OpportunityRow, format_datetime, parse_datetime, utc_now
@@ -897,7 +898,12 @@ def _reduce_position(position: PaperPosition, chunk_notional_usd: float) -> None
     position.updated_at = utc_now()
 
 
-def _add_to_position(position: PaperPosition, row: OpportunityRow) -> PaperPosition:
+def _add_to_position(
+    position: PaperPosition,
+    row: OpportunityRow,
+    spot_quantity: float | None = None,
+    perp_quantity: float | None = None,
+) -> PaperPosition:
     old_notional = position.notional_usd
     new_notional = old_notional + row.notional_usd
     spot_entry_price = row.spot_entry_avg_price or 0.0
@@ -905,11 +911,19 @@ def _add_to_position(position: PaperPosition, row: OpportunityRow) -> PaperPosit
     if spot_entry_price <= 0 or perp_entry_price <= 0:
         return position
 
-    position.spot_qty += row.notional_usd / spot_entry_price
-    position.perp_qty += row.notional_usd / perp_entry_price
+    added_spot_qty = spot_quantity or row.notional_usd / spot_entry_price
+    added_perp_qty = perp_quantity or row.notional_usd / perp_entry_price
+    old_spot_cost = position.spot_qty * position.spot_entry_price
+    old_perp_cost = position.perp_qty * position.perp_entry_price
+    position.spot_qty += added_spot_qty
+    position.perp_qty += added_perp_qty
     position.notional_usd = new_notional
-    position.spot_entry_price = new_notional / position.spot_qty
-    position.perp_entry_price = new_notional / position.perp_qty
+    position.spot_entry_price = (
+        old_spot_cost + added_spot_qty * spot_entry_price
+    ) / position.spot_qty
+    position.perp_entry_price = (
+        old_perp_cost + added_perp_qty * perp_entry_price
+    ) / position.perp_qty
     position.entry_basis_pct = (
         (position.entry_basis_pct * old_notional) + ((row.basis_pct or 0.0) * row.notional_usd)
     ) / new_notional
@@ -937,6 +951,7 @@ def run_paper_strategy_once(
     config: KucoinBasisConfig = DEFAULT_CONFIG,
     opportunity_path: Path | None = None,
     funding_client: KucoinPublicClient | None = None,
+    execution_adapter: ExecutionAdapter | None = None,
 ) -> dict:
     store = PaperStore(config)
     now = utc_now()
@@ -949,6 +964,8 @@ def run_paper_strategy_once(
     _repair_missing_next_funding_times(positions, store, config)
     by_base = _open_notional_by_base(positions)
     funding_client = funding_client or KucoinPublicClient()
+    execution_attempts = 0
+    execution_rejections = 0
 
     latest_by_position = {}
     for row in opportunities:
@@ -1278,6 +1295,85 @@ def run_paper_strategy_once(
                 )
                 continue
 
+            if execution_adapter is not None:
+                exit_fraction = min(1.0, exit_chunk / position.notional_usd)
+                target_base_quantity = min(
+                    position.spot_qty * exit_fraction,
+                    position.perp_qty * exit_fraction,
+                )
+                execution_result = execution_adapter.execute(
+                    "EXIT",
+                    exit_row,
+                    exit_chunk,
+                    target_base_quantity=target_base_quantity,
+                )
+                execution_attempts += 1
+                store.append_execution_attempt(execution_result.to_csv_row())
+                if not execution_result.accepted:
+                    execution_rejections += 1
+                    store.append_decision(
+                        {
+                            "timestamp_utc": format_datetime(utc_now()),
+                            "decision_type": "EXIT",
+                            "base": position.base,
+                            "direction": position.direction,
+                            "position_id": position.position_id,
+                            "opportunity_key": exit_row.opportunity_key,
+                            "allowed": "False",
+                            "reason": f"dry_run_preflight_rejected: {execution_result.reason}",
+                            "notional_usd": f"{exit_chunk:.8f}",
+                            "expected_edge_pct": (
+                                ""
+                                if exit_row.expected_edge_pct is None
+                                else f"{exit_row.expected_edge_pct:.8f}"
+                            ),
+                            "estimated_net_pnl_usd": f"{exit_estimate.net_pnl_usd:.8f}",
+                            "row_timestamp_utc": format_datetime(exit_row.timestamp_utc),
+                            "row_age_seconds": f"{_row_age_seconds(exit_row, utc_now()):.3f}",
+                            "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
+                            "current_basis_pct": f"{position.current_basis_pct:.8f}",
+                            "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
+                            **exit_audit_fields,
+                        }
+                    )
+                    continue
+                exit_row = replace(
+                    exit_row,
+                    notional_usd=exit_chunk,
+                    spot_exit_avg_price=execution_result.spot_average_price,
+                    perp_exit_avg_price=execution_result.perp_average_price,
+                    spot_exit_slippage_pct=execution_result.spot_slippage_pct,
+                    perp_exit_slippage_pct=execution_result.perp_slippage_pct,
+                    spot_ask=(
+                        execution_result.spot_average_price
+                        if position.direction == "SHORT_SPOT_LONG_PERP"
+                        else exit_row.spot_ask
+                    ),
+                    perp_bid=(
+                        execution_result.perp_average_price
+                        if position.direction == "SHORT_SPOT_LONG_PERP"
+                        else exit_row.perp_bid
+                    ),
+                    spot_bid=(
+                        execution_result.spot_average_price
+                        if position.direction == "LONG_SPOT_SHORT_PERP"
+                        else exit_row.spot_bid
+                    ),
+                    perp_ask=(
+                        execution_result.perp_average_price
+                        if position.direction == "LONG_SPOT_SHORT_PERP"
+                        else exit_row.perp_ask
+                    ),
+                )
+                exit_estimate = _estimate_exit_chunk(
+                    position,
+                    exit_row,
+                    config,
+                    exit_chunk,
+                )
+                if exit_estimate is None:
+                    continue
+
             event_type = "CLOSE_POSITION" if exit_chunk >= position.notional_usd - 1e-8 else "PARTIAL_CLOSE"
             store.append_fill(
                 {
@@ -1370,6 +1466,28 @@ def run_paper_strategy_once(
             allowed = False
             reason = "max_symbol_exposure"
 
+        execution_result = None
+        execution_row = row
+        if allowed and execution_adapter is not None:
+            execution_result = execution_adapter.execute(
+                "ENTRY", row, row.notional_usd
+            )
+            execution_attempts += 1
+            store.append_execution_attempt(execution_result.to_csv_row())
+            if not execution_result.accepted:
+                execution_rejections += 1
+                allowed = False
+                reason = f"dry_run_preflight_rejected: {execution_result.reason}"
+            else:
+                execution_row = replace(
+                    row,
+                    notional_usd=execution_result.executable_notional_usd,
+                    spot_entry_avg_price=execution_result.spot_average_price,
+                    perp_entry_avg_price=execution_result.perp_average_price,
+                    spot_entry_slippage_pct=execution_result.spot_slippage_pct,
+                    perp_entry_slippage_pct=execution_result.perp_slippage_pct,
+                )
+
         store.append_decision(
             {
                 "timestamp_utc": format_datetime(utc_now()),
@@ -1393,13 +1511,23 @@ def run_paper_strategy_once(
         if not allowed:
             continue
 
+        row = execution_row
+        new_symbol_notional = by_base.get(row.base, 0.0) + row.notional_usd
+
         spot_entry_price = row.spot_entry_avg_price or row.spot_ask or 0.0
         perp_entry_price = row.perp_entry_avg_price or row.perp_bid or 0.0
         if spot_entry_price <= 0 or perp_entry_price <= 0:
             continue
 
         if existing_position is not None:
-            position = _add_to_position(existing_position, row)
+            position = _add_to_position(
+                existing_position,
+                row,
+                spot_quantity=(execution_result.spot_size if execution_result else None),
+                perp_quantity=(
+                    execution_result.perp_base_quantity if execution_result else None
+                ),
+            )
             event_type = "ADD_POSITION"
         else:
             funding_benefit_pct = (
@@ -1414,8 +1542,16 @@ def run_paper_strategy_once(
                 spot_symbol=row.spot_symbol,
                 perp_symbol=row.perp_symbol,
                 notional_usd=row.notional_usd,
-                spot_qty=row.notional_usd / spot_entry_price,
-                perp_qty=row.notional_usd / perp_entry_price,
+                spot_qty=(
+                    execution_result.spot_size
+                    if execution_result and execution_result.spot_size > 0
+                    else row.notional_usd / spot_entry_price
+                ),
+                perp_qty=(
+                    execution_result.perp_base_quantity
+                    if execution_result and execution_result.perp_base_quantity > 0
+                    else row.notional_usd / perp_entry_price
+                ),
                 spot_entry_price=spot_entry_price,
                 perp_entry_price=perp_entry_price,
                 entry_basis_pct=row.basis_pct or 0.0,
@@ -1464,4 +1600,6 @@ def run_paper_strategy_once(
         "fresh_opportunities_seen": len(opportunities),
         "entries_opened": entries,
         "open_positions": len(positions),
+        "execution_attempts": execution_attempts,
+        "execution_rejections": execution_rejections,
     }

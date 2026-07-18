@@ -25,6 +25,7 @@ class KucoinBasisConfig:
     max_total_notional_usd: float = 50_000.0
     max_symbol_notional_usd: float = 5_000.0
     max_open_positions: int = 100
+    dry_run_max_hedge_mismatch_bps: float = 25.0
 
     chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0, 1_000.0)
     max_chunk_notional_usd: float = 1_000.0

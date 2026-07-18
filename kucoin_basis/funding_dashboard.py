@@ -5,6 +5,7 @@ import csv
 import json
 import sys
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1644,6 +1645,8 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
 
 
 class FundingDashboardHandler(BaseHTTPRequestHandler):
+    config = DEFAULT_CONFIG
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -1661,19 +1664,19 @@ class FundingDashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/shortlist":
             try:
-                self._send_json(HTTPStatus.OK, load_shortlist_payload())
+                self._send_json(HTTPStatus.OK, load_shortlist_payload(self.config))
             except Exception as exc:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         if parsed.path == "/api/positions":
             try:
-                self._send_json(HTTPStatus.OK, load_positions_payload())
+                self._send_json(HTTPStatus.OK, load_positions_payload(self.config))
             except Exception as exc:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
         if parsed.path == "/api/summary":
             try:
-                self._send_json(HTTPStatus.OK, load_summary_payload())
+                self._send_json(HTTPStatus.OK, load_summary_payload(self.config))
             except Exception as exc:
                 self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(exc)})
             return
@@ -1698,13 +1701,27 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a local KuCoin funding-rate dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--state-mode",
+        choices=("paper", "dry-run"),
+        default="paper",
+        help="Choose the isolated strategy ledger displayed by Positions and Summary.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    FundingDashboardHandler.config = (
+        replace(DEFAULT_CONFIG, paper_dir=DEFAULT_CONFIG.data_dir / "dry_run")
+        if args.state_mode == "dry-run"
+        else DEFAULT_CONFIG
+    )
     server = ThreadingHTTPServer((args.host, args.port), FundingDashboardHandler)
-    print(f"KuCoin funding dashboard running at http://{args.host}:{args.port}/")
+    print(
+        f"KuCoin funding dashboard ({args.state_mode}) running at "
+        f"http://{args.host}:{args.port}/"
+    )
     server.serve_forever()
 
 
