@@ -5,6 +5,7 @@ import csv
 import sys
 import time
 import traceback
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,7 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from kucoin_basis.config import DEFAULT_CONFIG
+from kucoin_basis.config import DEFAULT_CONFIG, KucoinBasisConfig
+from kucoin_basis.kucoin_public_client import KucoinPublicClient
 from kucoin_basis.opportunity_scanner import scan_once
 
 
@@ -38,12 +40,26 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_CONFIG.orderbook_monitor_interval_seconds,
         help="Seconds between loop scans.",
     )
+    parser.add_argument(
+        "--state-mode",
+        choices=("paper", "dry-run"),
+        default="paper",
+        help="Position ledger used to keep open symbols on the scanner watchlist.",
+    )
     return parser.parse_args()
 
 
-def _append_scanner_run(row: dict) -> None:
-    DEFAULT_CONFIG.data_dir.mkdir(parents=True, exist_ok=True)
-    path = DEFAULT_CONFIG.data_dir / "scanner_runs.csv"
+def config_for_state_mode(state_mode: str) -> KucoinBasisConfig:
+    if state_mode == "dry-run":
+        return replace(DEFAULT_CONFIG, paper_dir=DEFAULT_CONFIG.data_dir / "dry_run")
+    if state_mode == "paper":
+        return DEFAULT_CONFIG
+    raise ValueError(f"Unsupported scanner state mode: {state_mode}")
+
+
+def _append_scanner_run(config: KucoinBasisConfig, row: dict) -> None:
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    path = config.data_dir / "scanner_runs.csv"
     file_exists = path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=SCANNER_RUN_FIELDS)
@@ -52,13 +68,14 @@ def _append_scanner_run(row: dict) -> None:
         writer.writerow({field: row.get(field, "") for field in SCANNER_RUN_FIELDS})
 
 
-def _run_once() -> None:
+def _run_once(config: KucoinBasisConfig, client: KucoinPublicClient) -> None:
     started = time.monotonic()
     timestamp = datetime.now(timezone.utc).isoformat()
-    path, rows, errors = scan_once(DEFAULT_CONFIG)
+    path, rows, errors = scan_once(config, client)
     candidates = sum(1 for row in rows if row.decision == "ENTER_CANDIDATE")
     elapsed = time.monotonic() - started
     _append_scanner_run(
+        config,
         {
             "timestamp_utc": timestamp,
             "status": "OK" if not errors else "OK_WITH_ERRORS",
@@ -77,10 +94,11 @@ def _run_once() -> None:
             print(f"  {error}", flush=True)
 
 
-def _log_exception(error: Exception, started: float) -> None:
+def _log_exception(config: KucoinBasisConfig, error: Exception, started: float) -> None:
     elapsed = time.monotonic() - started
     summary = f"{type(error).__name__}: {error}"
     _append_scanner_run(
+        config,
         {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "status": "ERROR",
@@ -94,12 +112,15 @@ def _log_exception(error: Exception, started: float) -> None:
 
 def main() -> None:
     args = parse_args()
+    config = config_for_state_mode(args.state_mode)
+    client = KucoinPublicClient()
+    print(f"Scanner position watchlist: {args.state_mode} ({config.paper_dir})", flush=True)
     while True:
         started = time.monotonic()
         try:
-            _run_once()
+            _run_once(config, client)
         except Exception as error:
-            _log_exception(error, started)
+            _log_exception(config, error, started)
             if not args.loop:
                 raise
         if not args.loop:

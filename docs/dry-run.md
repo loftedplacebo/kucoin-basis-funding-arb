@@ -35,10 +35,10 @@ withdrawal permission and apply an IP whitelist before any future live work.
 
 ## Run
 
-Keep the public scanner running as normal:
+Run the public scanner against the isolated dry-run position ledger:
 
 ```powershell
-python kucoin_basis\run_scanner.py --loop --interval 60
+python kucoin_basis\run_scanner.py --state-mode dry-run --loop --interval 60
 ```
 
 Run one dry pass:

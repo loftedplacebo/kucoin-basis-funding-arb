@@ -16,6 +16,7 @@ test endpoints. There is no live execution mode or live-order method.
 | Scanner | `python kucoin_basis/run_scanner.py --loop --interval 60` | `kucoin-basis-scanner` | 60 seconds |
 | Paper strategy | `python kucoin_basis/run_paper_strategy.py --loop --interval 60` | `kucoin-basis-strategy` | 60 seconds |
 | Dashboard | `python kucoin_basis/run_funding_dashboard.py --port 8766` | `kucoin-basis-dashboard` | `127.0.0.1:8766` |
+| Dry-run scanner | `python kucoin_basis/run_scanner.py --state-mode dry-run --loop --interval 60` | Local only | 60 seconds |
 | Dry-run strategy | `python kucoin_basis/run_paper_strategy.py --execution-mode dry-run --loop --interval 60` | Local only | 60 seconds |
 | Dry-run dashboard | `python kucoin_basis/run_funding_dashboard.py --state-mode dry-run --port 8767` | Local only | `127.0.0.1:8767` |
 
@@ -292,7 +293,7 @@ The full dry-run setup and safety boundary are documented in
 ## Commands
 
 ```bash
-python kucoin_basis/run_scanner.py
+python kucoin_basis/run_scanner.py --state-mode dry-run
 python kucoin_basis/run_paper_strategy.py
 python kucoin_basis/run_paper_strategy.py --execution-mode dry-run
 python kucoin_basis/run_funding_dashboard.py --port 8766

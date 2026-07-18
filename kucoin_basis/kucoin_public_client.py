@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 import requests
 
@@ -11,31 +12,106 @@ from core.orderbook import parse_orderbook_levels
 
 SPOT_BASE_URL = "https://api.kucoin.com"
 FUTURES_BASE_URL = "https://api-futures.kucoin.com"
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class KucoinPublicClient:
     """Unauthenticated KuCoin REST client for research and paper trading."""
 
-    def __init__(self):
-        self.session = requests.Session()
+    def __init__(
+        self,
+        *,
+        session: requests.Session | None = None,
+        min_request_interval_seconds: float = 0.10,
+        max_retries: int = 3,
+        retry_backoff_seconds: float = 1.0,
+        spot_symbols_cache_seconds: float = 300.0,
+        active_contracts_cache_seconds: float = 5.0,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        self.session = session or requests.Session()
+        self.min_request_interval_seconds = max(0.0, min_request_interval_seconds)
+        self.max_retries = max(0, max_retries)
+        self.retry_backoff_seconds = max(0.0, retry_backoff_seconds)
+        self.spot_symbols_cache_seconds = max(0.0, spot_symbols_cache_seconds)
+        self.active_contracts_cache_seconds = max(0.0, active_contracts_cache_seconds)
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._last_request_at: float | None = None
+        self._spot_symbols: tuple[float, list[dict]] | None = None
+        self._active_contracts: tuple[float, list[dict]] | None = None
         self._spot_symbol_cache: dict[str, dict] = {}
         self._contract_cache: dict[str, dict] = {}
 
+    def _pace_request(self) -> None:
+        if self._last_request_at is not None:
+            elapsed = self._monotonic() - self._last_request_at
+            delay = self.min_request_interval_seconds - elapsed
+            if delay > 0:
+                self._sleep(delay)
+        self._last_request_at = self._monotonic()
+
+    def _retry_delay(self, response: requests.Response | None, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if retry_after:
+            try:
+                return min(30.0, max(0.0, float(retry_after)))
+            except ValueError:
+                pass
+        return min(30.0, self.retry_backoff_seconds * (2**attempt))
+
     def _get(self, base_url: str, path: str, params: Optional[dict] = None):
-        response = self.session.get(f"{base_url}{path}", params=params, timeout=20)
-        response.raise_for_status()
-        payload = response.json()
-        if payload.get("code") != "200000":
-            raise RuntimeError(f"KuCoin public API error for {path}: {payload}")
-        return payload.get("data")
+        response: requests.Response | None = None
+        for attempt in range(self.max_retries + 1):
+            self._pace_request()
+            try:
+                response = self.session.get(
+                    f"{base_url}{path}", params=params, timeout=20
+                )
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt >= self.max_retries:
+                    raise
+                self._sleep(self._retry_delay(None, attempt))
+                continue
+
+            if (
+                response.status_code in RETRYABLE_STATUS_CODES
+                and attempt < self.max_retries
+            ):
+                self._sleep(self._retry_delay(response, attempt))
+                continue
+
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("code") != "200000":
+                raise RuntimeError(f"KuCoin public API error for {path}: {payload}")
+            return payload.get("data")
+        raise RuntimeError(f"KuCoin public API retry loop exhausted for {path}")
+
+    def _cached(
+        self, item: tuple[float, list[dict]] | None, ttl: float
+    ) -> list[dict] | None:
+        if item is None or self._monotonic() - item[0] >= ttl:
+            return None
+        return item[1]
 
     def get_spot_symbols(self) -> list[dict]:
+        cached = self._cached(self._spot_symbols, self.spot_symbols_cache_seconds)
+        if cached is not None:
+            return cached
         data = self._get(SPOT_BASE_URL, "/api/v1/symbols")
-        return data if isinstance(data, list) else []
+        symbols = data if isinstance(data, list) else []
+        self._spot_symbols = (self._monotonic(), symbols)
+        return symbols
 
     def get_active_contracts(self) -> list[dict]:
+        cached = self._cached(self._active_contracts, self.active_contracts_cache_seconds)
+        if cached is not None:
+            return cached
         data = self._get(FUTURES_BASE_URL, "/api/v1/contracts/active")
         contracts = data if isinstance(data, list) else []
+        self._active_contracts = (self._monotonic(), contracts)
         for contract in contracts:
             symbol = str(contract.get("symbol", ""))
             if symbol:
@@ -108,9 +184,19 @@ class KucoinPublicClient:
                 params={"symbol": exchange_symbol},
             )
             return data if isinstance(data, dict) else {}
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code in RETRYABLE_STATUS_CODES:
+                raise
+        except (requests.ConnectionError, requests.Timeout):
+            raise
         except Exception:
-            data = self._get(FUTURES_BASE_URL, f"/api/v1/funding-rate/{exchange_symbol}/current")
-            return data if isinstance(data, dict) else {}
+            pass
+        data = self._get(
+            FUTURES_BASE_URL,
+            f"/api/v1/funding-rate/{exchange_symbol}/current",
+        )
+        return data if isinstance(data, dict) else {}
 
     def get_public_funding_history(
         self,

@@ -49,6 +49,7 @@ http://127.0.0.1:8766/
 Run the authenticated strategy dry run and its isolated dashboard:
 
 ```powershell
+python kucoin_basis\run_scanner.py --state-mode dry-run --loop --interval 60
 python kucoin_basis\run_paper_strategy.py --execution-mode dry-run --loop --interval 60
 python kucoin_basis\run_funding_dashboard.py --state-mode dry-run --host 127.0.0.1 --port 8767
 ```
