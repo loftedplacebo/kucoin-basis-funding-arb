@@ -70,7 +70,13 @@ class KucoinBasisConfig:
     capital_recycle_funding_rate_pct: float = 0.50
     capital_recycle_min_symbol_exposure_fraction: float = 0.80
     min_profit_to_full_exit_pct: float = 0.02
-    juicy_hold_funding_rate_pct: float = 1.00
+    juicy_hold_funding_rate_pct: float = 0.75
+    economic_funding_hold_enabled: bool = True
+    next_funding_value_haircut: float = 0.90
+    redeployment_edge_haircut: float = 0.75
+    basis_giveback_risk_std_multiplier: float = 0.50
+    basis_giveback_risk_improvement_fraction: float = 0.25
+    economic_hold_min_advantage_usd: float = 0.05
     post_close_reentry_cooldown_minutes: float = 60.0
     fallback_funding_interval_hours: float = 8.0
 

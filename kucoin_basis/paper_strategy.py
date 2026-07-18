@@ -24,6 +24,27 @@ class ExitEstimate:
     net_pnl_pct: float
 
 
+@dataclass(frozen=True)
+class ExitValueComparison:
+    chunk_notional_usd: float
+    risk_adjusted_next_funding_usd: float
+    risk_adjusted_exit_redeploy_usd: float
+    best_redeployment_edge_pct: float
+    basis_giveback_risk_usd: float
+
+    @property
+    def hold_is_preferred(self) -> bool:
+        return self.risk_adjusted_next_funding_usd > self.risk_adjusted_exit_redeploy_usd
+
+
+DISCRETIONARY_POST_FUNDING_EXIT_REASONS = {
+    "basis_converged_take_profit",
+    "basis_near_flat_take_profit",
+    "unusually_attractive_all_in_unwind",
+    "capital_recycle_profitable_unwind",
+}
+
+
 def latest_opportunity_file(config: KucoinBasisConfig) -> Path:
     files = sorted(config.opportunities_dir.glob("kucoin_basis_opportunities_*.csv"))
     if not files:
@@ -732,6 +753,101 @@ def _capital_recycle_is_preferred(
     return funding_benefit_pct is None or funding_benefit_pct < config.capital_recycle_funding_rate_pct
 
 
+def _best_redeployment_edge_pct(
+    rows: list[OpportunityRow],
+    *,
+    position: PaperPosition,
+    positions: dict[str, PaperPosition],
+    chunk_notional_usd: float,
+    config: KucoinBasisConfig,
+) -> float:
+    open_notional_by_base = _open_notional_by_base(positions)
+    candidates: list[float] = []
+    for candidate in rows:
+        if (
+            candidate.base == position.base
+            or candidate.decision != "ENTER_CANDIDATE"
+            or not candidate.round_trip_fillable
+            or candidate.expected_edge_pct is None
+            or candidate.expected_edge_pct < config.min_expected_edge_pct
+            or candidate.notional_usd + 1e-8 < chunk_notional_usd
+        ):
+            continue
+        candidate_position_id = _position_id(candidate.base, candidate.direction)
+        if (
+            candidate_position_id not in positions
+            and len(positions) >= config.max_open_positions
+        ):
+            continue
+        if (
+            open_notional_by_base.get(candidate.base, 0.0) + chunk_notional_usd
+            > config.max_symbol_notional_usd + 1e-8
+        ):
+            continue
+        candidates.append(candidate.expected_edge_pct)
+    return max(candidates, default=0.0)
+
+
+def _compare_hold_with_exit_and_redeployment(
+    rows: list[OpportunityRow],
+    *,
+    position: PaperPosition,
+    reference_row: OpportunityRow,
+    positions: dict[str, PaperPosition],
+    config: KucoinBasisConfig,
+) -> ExitValueComparison | None:
+    if not config.economic_funding_hold_enabled:
+        return None
+    funding_benefit_pct = _funding_benefit_pct(position, reference_row)
+    if funding_benefit_pct is None or funding_benefit_pct <= 0:
+        return None
+
+    chunk = min(config.funding_harvest_unwind_chunk_usd, position.notional_usd)
+    if chunk <= 0:
+        return None
+    best_redeployment_edge_pct = _best_redeployment_edge_pct(
+        rows,
+        position=position,
+        positions=positions,
+        chunk_notional_usd=chunk,
+        config=config,
+    )
+    basis_improvement_pct = max(0.0, _basis_improvement_pct(position))
+    statistical_risk_pct = max(0.0, reference_row.basis_std_pct or 0.0) * (
+        config.basis_giveback_risk_std_multiplier
+    )
+    fallback_risk_pct = (
+        basis_improvement_pct * config.basis_giveback_risk_improvement_fraction
+    )
+    basis_giveback_risk_pct = min(
+        basis_improvement_pct,
+        max(statistical_risk_pct, fallback_risk_pct),
+    )
+
+    risk_adjusted_next_funding_usd = (
+        chunk * funding_benefit_pct / 100 * config.next_funding_value_haircut
+    )
+    risk_adjusted_redeployment_usd = (
+        chunk
+        * best_redeployment_edge_pct
+        / 100
+        * config.redeployment_edge_haircut
+    )
+    basis_giveback_risk_usd = chunk * basis_giveback_risk_pct / 100
+    risk_adjusted_exit_redeploy_usd = (
+        risk_adjusted_redeployment_usd
+        + basis_giveback_risk_usd
+        + config.economic_hold_min_advantage_usd
+    )
+    return ExitValueComparison(
+        chunk_notional_usd=chunk,
+        risk_adjusted_next_funding_usd=risk_adjusted_next_funding_usd,
+        risk_adjusted_exit_redeploy_usd=risk_adjusted_exit_redeploy_usd,
+        best_redeployment_edge_pct=best_redeployment_edge_pct,
+        basis_giveback_risk_usd=basis_giveback_risk_usd,
+    )
+
+
 def _choose_funding_harvest_close(
     rows: list[OpportunityRow],
     *,
@@ -885,6 +1001,7 @@ def run_paper_strategy_once(
         foregone_funding_usd: float | None = None
         pre_funding_exit_profit_usd: float | None = None
         capital_recycle_triggered = False
+        exit_value_comparison: ExitValueComparison | None = None
 
         if position.funding_events_captured <= 0:
             pre_funding_exit = _choose_pre_funding_take_profit_close(
@@ -930,6 +1047,23 @@ def run_paper_strategy_once(
                     should_exit = True
                     reason = "capital_recycle_profitable_unwind"
                     capital_recycle_triggered = True
+
+        if reason in DISCRETIONARY_POST_FUNDING_EXIT_REASONS:
+            exit_value_comparison = _compare_hold_with_exit_and_redeployment(
+                opportunities,
+                position=position,
+                reference_row=row,
+                positions=positions,
+                config=config,
+            )
+            if (
+                exit_value_comparison is not None
+                and exit_value_comparison.hold_is_preferred
+            ):
+                should_exit = False
+                selected_exit = None
+                capital_recycle_triggered = False
+                reason = "hold_for_superior_next_funding_value"
 
         if reason == "hold_basis_moved_adversely":
             _ensure_cooldown(
@@ -986,6 +1120,35 @@ def run_paper_strategy_once(
             "capital_recycle_triggered": str(capital_recycle_triggered),
             "foregone_funding_usd": (
                 "" if foregone_funding_usd is None else f"{foregone_funding_usd:.8f}"
+            ),
+            "economic_hold_applied": str(
+                exit_value_comparison is not None
+                and exit_value_comparison.hold_is_preferred
+            ),
+            "economic_comparison_chunk_usd": (
+                ""
+                if exit_value_comparison is None
+                else f"{exit_value_comparison.chunk_notional_usd:.8f}"
+            ),
+            "risk_adjusted_next_funding_usd": (
+                ""
+                if exit_value_comparison is None
+                else f"{exit_value_comparison.risk_adjusted_next_funding_usd:.8f}"
+            ),
+            "risk_adjusted_exit_redeploy_usd": (
+                ""
+                if exit_value_comparison is None
+                else f"{exit_value_comparison.risk_adjusted_exit_redeploy_usd:.8f}"
+            ),
+            "best_redeployment_edge_pct": (
+                ""
+                if exit_value_comparison is None
+                else f"{exit_value_comparison.best_redeployment_edge_pct:.8f}"
+            ),
+            "basis_giveback_risk_usd": (
+                ""
+                if exit_value_comparison is None
+                else f"{exit_value_comparison.basis_giveback_risk_usd:.8f}"
             ),
         }
         decision_now = utc_now()

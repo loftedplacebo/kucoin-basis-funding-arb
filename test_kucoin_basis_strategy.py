@@ -89,12 +89,13 @@ def make_row(notional_usd: float, spot_exit_slippage_pct: float, perp_exit_slipp
     )
 
 
-def make_config(root: Path) -> KucoinBasisConfig:
+def make_config(root: Path, **overrides) -> KucoinBasisConfig:
     return KucoinBasisConfig(
         data_dir=root / "data",
         opportunities_dir=root / "data" / "opportunities",
         paper_dir=root / "data" / "paper",
         archive_dir=root / "data" / "archive",
+        **overrides,
     )
 
 
@@ -854,6 +855,22 @@ def test_very_juicy_next_funding_overrides_basis_take_profit():
     assert reason == "hold_for_juicy_next_funding"
 
 
+def test_default_juicy_threshold_holds_at_three_quarters_percent():
+    config = KucoinBasisConfig()
+    position = make_position(
+        entry_basis_pct=-5.0,
+        current_basis_pct=-4.0,
+        funding_events_captured=1,
+    )
+    row = replace_row(make_row(500.0, 0.01, 0.01), funding_rate_pct=-0.75)
+
+    should_exit, reason = _should_exit(position, row, config)
+
+    assert config.juicy_hold_funding_rate_pct == 0.75
+    assert should_exit is False
+    assert reason == "hold_for_juicy_next_funding"
+
+
 def test_profitable_next_funding_holds_until_an_exit_trigger_after_funding():
     config = KucoinBasisConfig(min_hold_funding_rate_pct=0.30, juicy_hold_funding_rate_pct=1.0)
     position = make_position(
@@ -868,6 +885,99 @@ def test_profitable_next_funding_holds_until_an_exit_trigger_after_funding():
 
     assert should_exit is False
     assert reason == "hold_for_next_funding_and_basis"
+
+
+def test_basis_exit_holds_when_next_funding_value_beats_redeployment():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            entry_basis_pct=-1.0,
+            current_basis_pct=-1.0,
+            realised_funding_pnl_usd=5.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.6,
+            basis_pct=-0.3,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 500.0
+        assert not store.fills_path.exists()
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decision = [item for item in decisions if item["decision_type"] == "EXIT"][-1]
+        assert exit_decision["allowed"] == "False"
+        assert exit_decision["reason"] == "hold_for_superior_next_funding_value"
+        assert exit_decision["economic_hold_applied"] == "True"
+        assert parse_float(exit_decision["risk_adjusted_next_funding_usd"]) > parse_float(
+            exit_decision["risk_adjusted_exit_redeploy_usd"]
+        )
+
+
+def test_basis_exit_proceeds_when_redeployment_value_is_stronger():
+    with TemporaryDirectory() as tmp:
+        config = make_config(Path(tmp))
+        store = PaperStore(config)
+        position = make_position(
+            entry_basis_pct=-1.0,
+            current_basis_pct=-1.0,
+            realised_funding_pnl_usd=5.0,
+            funding_events_captured=1,
+        )
+        store.write_positions({position.position_id: position})
+        now = datetime.now(timezone.utc)
+        current_row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=now - timedelta(seconds=30),
+            funding_rate_pct=-0.6,
+            basis_pct=-0.3,
+            decision="REJECT",
+            reason="open_position_watchlist",
+        )
+        alternative_row = replace_row(
+            make_row(100.0, 0.01, 0.01),
+            timestamp_utc=current_row.timestamp_utc,
+            base="KCS",
+            spot_symbol="KCS-USDT",
+            perp_symbol="KCSUSDTM",
+            expected_edge_pct=1.2,
+            decision="ENTER_CANDIDATE",
+            reason="entry_rules_passed",
+        )
+        opportunity_path = config.opportunities_dir / "kucoin_basis_opportunities_test.csv"
+        write_opportunities(opportunity_path, [current_row, alternative_row])
+
+        run_paper_strategy_once(config, opportunity_path)
+
+        assert store.load_open_positions()[position.position_id].notional_usd == 400.0
+        with store.fills_path.open("r", newline="", encoding="utf-8") as f:
+            fills = list(csv.DictReader(f))
+        mira_closes = [item for item in fills if item["base"] == "MIRA" and "CLOSE" in item["event_type"]]
+        assert mira_closes[-1]["reason"] == "basis_converged_take_profit"
+        with store.decisions_path.open("r", newline="", encoding="utf-8") as f:
+            decisions = list(csv.DictReader(f))
+        exit_decision = [
+            item
+            for item in decisions
+            if item["decision_type"] == "EXIT" and item["base"] == "MIRA"
+        ][-1]
+        assert exit_decision["allowed"] == "True"
+        assert exit_decision["economic_hold_applied"] == "False"
+        assert parse_float(exit_decision["best_redeployment_edge_pct"]) == 1.2
+        assert parse_float(exit_decision["risk_adjusted_next_funding_usd"]) < parse_float(
+            exit_decision["risk_adjusted_exit_redeploy_usd"]
+        )
 
 
 def test_exceptional_pre_funding_profit_takes_best_partial_chunk():
@@ -1018,7 +1128,7 @@ def test_moderate_funding_holds_when_no_post_funding_exit_trigger_is_met():
 
 def test_unusually_attractive_all_in_chunk_can_unwind_with_moderate_funding():
     with TemporaryDirectory() as tmp:
-        config = make_config(Path(tmp))
+        config = make_config(Path(tmp), economic_funding_hold_enabled=False)
         store = PaperStore(config)
         position = make_position(realised_funding_pnl_usd=4.0, funding_events_captured=1)
         store.write_positions({position.position_id: position})
@@ -1045,7 +1155,7 @@ def test_unusually_attractive_all_in_chunk_can_unwind_with_moderate_funding():
 
 def test_large_position_can_recycle_profitable_chunk_when_funding_is_only_moderate():
     with TemporaryDirectory() as tmp:
-        config = make_config(Path(tmp))
+        config = make_config(Path(tmp), economic_funding_hold_enabled=False)
         store = PaperStore(config)
         position = make_position(
             notional_usd=4_000.0,
@@ -1193,7 +1303,7 @@ def test_positions_dashboard_separates_entry_and_next_funding_estimates():
 
 def test_profitable_post_funding_unwind_closes_best_chunk_only():
     with TemporaryDirectory() as tmp:
-        config = make_config(Path(tmp))
+        config = make_config(Path(tmp), economic_funding_hold_enabled=False)
         store = PaperStore(config)
         position = make_position(
             notional_usd=500.0,
@@ -1344,7 +1454,7 @@ def test_weak_funding_exit_harvests_profitable_100_usd_chunk_all_in():
 
 def test_basis_target_can_harvest_funding_when_trade_pnl_is_still_negative():
     with TemporaryDirectory() as tmp:
-        config = make_config(Path(tmp))
+        config = make_config(Path(tmp), economic_funding_hold_enabled=False)
         store = PaperStore(config)
         position = make_position(
             notional_usd=500.0,
@@ -1717,7 +1827,10 @@ if __name__ == "__main__":
     test_stale_close_row_is_not_used_for_exit_decision()
     test_adverse_basis_holds_instead_of_hard_exit()
     test_very_juicy_next_funding_overrides_basis_take_profit()
+    test_default_juicy_threshold_holds_at_three_quarters_percent()
     test_profitable_next_funding_holds_until_an_exit_trigger_after_funding()
+    test_basis_exit_holds_when_next_funding_value_beats_redeployment()
+    test_basis_exit_proceeds_when_redeployment_value_is_stronger()
     test_exceptional_pre_funding_profit_takes_best_partial_chunk()
     test_pre_funding_profit_still_holds_below_basis_improvement_threshold()
     test_pre_funding_profit_must_beat_foregone_funding_hurdle()

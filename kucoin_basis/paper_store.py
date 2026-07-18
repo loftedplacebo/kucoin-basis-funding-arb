@@ -90,6 +90,12 @@ DECISION_FIELDS = [
     "all_in_chunk_profit_usd",
     "capital_recycle_triggered",
     "foregone_funding_usd",
+    "economic_hold_applied",
+    "economic_comparison_chunk_usd",
+    "risk_adjusted_next_funding_usd",
+    "risk_adjusted_exit_redeploy_usd",
+    "best_redeployment_edge_pct",
+    "basis_giveback_risk_usd",
 ]
 
 PROCESSED_FIELDS = ["opportunity_key", "timestamp_utc", "source_file", "processed_at_utc"]

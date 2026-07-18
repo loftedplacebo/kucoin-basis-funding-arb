@@ -23,6 +23,7 @@ from kucoin_basis.models import OpportunityRow, parse_datetime, parse_float
 from kucoin_basis.paper_strategy import (
     _basis_improvement_pct,
     _basis_target_reason,
+    _compare_hold_with_exit_and_redeployment,
     _estimate_exit_chunk,
     _exit_slippage_cost_pct,
     _forced_unwind_reason,
@@ -550,6 +551,7 @@ HTML = """<!doctype html>
         hold_for_next_profitable_funding: "hold: funding good",
         hold_for_next_funding_and_basis: "hold: funding/basis",
         hold_for_juicy_next_funding: "hold: funding juicy",
+        hold_for_superior_next_funding_value: "hold: funding value wins",
         pre_funding_exceptional_take_profit: "pre-funding take-profit",
         basis_converged_take_profit: "basis target reached",
         basis_near_flat_take_profit: "basis near flat",
@@ -1108,7 +1110,14 @@ def _latest_opportunity_objects_by_position(config: KucoinBasisConfig) -> dict[t
     return by_position
 
 
-def _position_unwind_estimates(position, rows: list[OpportunityRow], config: KucoinBasisConfig) -> dict[str, str]:
+def _position_unwind_estimates(
+    position,
+    rows: list[OpportunityRow],
+    config: KucoinBasisConfig,
+    *,
+    all_rows: list[OpportunityRow] | None = None,
+    open_positions: dict | None = None,
+) -> dict[str, str]:
     result = {
         "next_unwind_chunk_usd": "",
         "next_unwind_pnl_ex_funding_usd": "",
@@ -1157,6 +1166,26 @@ def _position_unwind_estimates(position, rows: list[OpportunityRow], config: Kuc
         and estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd
         and _exit_slippage_cost_pct(row, config) <= config.max_entry_exit_cost_pct
     )
+    discretionary_exit_ready = (
+        basis_target_reached
+        or estimate.net_pnl_usd >= unusually_attractive_hurdle
+        or capital_recycle_ready
+    )
+    exit_value_comparison = (
+        _compare_hold_with_exit_and_redeployment(
+            all_rows,
+            position=position,
+            reference_row=row,
+            positions=open_positions,
+            config=config,
+        )
+        if discretionary_exit_ready and all_rows is not None and open_positions is not None
+        else None
+    )
+    economic_hold_preferred = (
+        exit_value_comparison is not None
+        and exit_value_comparison.hold_is_preferred
+    )
     forced_unwind_reason = _forced_unwind_reason(
         position,
         row,
@@ -1198,6 +1227,8 @@ def _position_unwind_estimates(position, rows: list[OpportunityRow], config: Kuc
             status = "weak funding: harvest"
         else:
             status = "hold"
+    elif economic_hold_preferred:
+        status = "hold: funding value wins"
     elif basis_target_reached and estimate.net_pnl_ex_funding_usd >= 0:
         status = "basis target: unwind"
     elif basis_target_reached and estimate.net_pnl_usd >= config.min_funding_harvest_unwind_profit_usd:
@@ -1433,6 +1464,16 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
             open_notional_by_base[position.base] += position.notional_usd
     decisions = _load_csv(store.decisions_path)
     latest_rows_by_position = _latest_opportunity_objects_by_position(config)
+    all_latest_market_rows = [
+        row
+        for market_rows in latest_rows_by_position.values()
+        for row in market_rows
+    ]
+    open_positions_by_id = {
+        position.position_id: position
+        for position in all_positions
+        if position.status == "OPEN"
+    }
     latest_exit_reason = {}
     for decision in decisions:
         if decision.get("decision_type") == "EXIT":
@@ -1488,6 +1529,8 @@ def load_positions_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
             position,
             market_rows,
             config,
+            all_rows=all_latest_market_rows,
+            open_positions=open_positions_by_id,
         ))
         positions.append(row)
     positions.sort(key=lambda item: (item.get("status") != "OPEN", item.get("base", ""), item.get("direction", "")))
@@ -1513,6 +1556,15 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
     active_cooldowns = store.load_active_cooldowns(now)
     latest_path, latest_rows = _latest_opportunity_rows(config)
     latest_rows_by_position = _latest_opportunity_objects_by_position(config)
+    all_latest_market_rows = [
+        row
+        for market_rows in latest_rows_by_position.values()
+        for row in market_rows
+    ]
+    open_positions_by_id = {
+        position.position_id: position
+        for position in open_positions
+    }
     corrected_trade_pnl_rows = _corrected_trade_pnl_rows(fills, funding_events)
 
     realised_funding_today = sum(
@@ -1543,6 +1595,8 @@ def load_summary_payload(config: KucoinBasisConfig = DEFAULT_CONFIG) -> dict:
             position,
             latest_rows_by_position.get((position.base, position.direction), []),
             config,
+            all_rows=all_latest_market_rows,
+            open_positions=open_positions_by_id,
         )
         estimated_open_next_unwind_pnl += parse_float(unwind.get("next_unwind_pnl_usd"), 0.0) or 0.0
         estimated_open_next_unwind_ex_funding_pnl += (
