@@ -150,6 +150,21 @@ def test_short_spot_entry_validates_auto_borrow_and_long_perp():
     assert private.margin_orders[0]["timeInForce"] == "IOC"
 
 
+def test_execution_rejects_excessive_fresh_leg_slippage_before_test_orders():
+    private = FakePrivateClient()
+    executor = KucoinDryRunExecutor(
+        private,
+        FakePublicClient(),
+        max_combined_entry_slippage_pct=-0.01,
+    )
+    result = executor.execute("ENTRY", make_row(100.0, 0.01, 0.01), 100.0)
+
+    assert not result.accepted
+    assert result.reason == "combined_slippage_too_high"
+    assert not private.margin_orders
+    assert not private.futures_orders
+
+
 def test_short_spot_exit_validates_auto_repay_and_reduce_only_perp():
     private = FakePrivateClient()
     executor = KucoinDryRunExecutor(private, FakePublicClient())

@@ -53,6 +53,10 @@ def main() -> None:
         execution_adapter = KucoinDryRunExecutor.from_env_file(
             args.env_file,
             max_hedge_mismatch_bps=config.dry_run_max_hedge_mismatch_bps,
+            max_entry_leg_slippage_pct=config.max_entry_leg_slippage_pct,
+            max_exit_leg_slippage_pct=config.max_exit_leg_slippage_pct,
+            max_combined_entry_slippage_pct=config.max_combined_entry_slippage_pct,
+            max_combined_exit_slippage_pct=config.max_combined_exit_slippage_pct,
         )
         print(
             "DRY RUN: KuCoin non-matching test orders enabled; live order endpoints are unavailable.",

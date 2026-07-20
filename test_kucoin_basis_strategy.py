@@ -206,7 +206,7 @@ class FailingFundingHistoryClient:
         raise RuntimeError("temporary history outage")
 
 
-def test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage():
+def test_gentle_unwind_chooses_largest_profitable_chunk():
     config = KucoinBasisConfig(
         gentle_unwind_chunk_ladder_usd=(100.0, 500.0),
         estimated_exit_fee_pct=0.0,
@@ -226,8 +226,8 @@ def test_gentle_unwind_chooses_best_net_pnl_pct_after_exit_slippage():
 
     assert selected is not None
     chunk, row, estimate = selected
-    assert chunk == 100.0
-    assert row.notional_usd == 100.0
+    assert chunk == 500.0
+    assert row.notional_usd == 500.0
     assert estimate.net_pnl_pct > 0
 
 
@@ -1024,7 +1024,10 @@ def test_basis_exit_proceeds_when_redeployment_value_is_stronger():
 
 def test_exceptional_pre_funding_profit_takes_best_partial_chunk():
     with TemporaryDirectory() as tmp:
-        config = make_config(Path(tmp))
+        config = make_config(
+            Path(tmp),
+            gentle_unwind_chunk_ladder_usd=(100.0, 75.0, 50.0, 500.0),
+        )
         store = PaperStore(config)
         position = make_position(
             notional_usd=1_000.0,

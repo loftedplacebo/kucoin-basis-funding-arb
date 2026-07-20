@@ -35,6 +35,10 @@ class KucoinBasisConfig:
     estimated_exit_fee_pct: float = 0.14
     safety_buffer_pct: float = 0.03
     max_entry_exit_cost_pct: float = 1.00
+    max_entry_leg_slippage_pct: float = 0.75
+    max_exit_leg_slippage_pct: float = 0.75
+    max_combined_entry_slippage_pct: float = 1.25
+    max_combined_exit_slippage_pct: float = 1.25
 
     max_orderbook_age_ms: int = 1_000
     max_basis_adverse_move_pct: float = 5.00
@@ -48,7 +52,7 @@ class KucoinBasisConfig:
     basis_near_flat_exit_abs_pct: float = 0.50
     basis_convergence_haircut: float = 0.50
     gentle_unwind_enabled: bool = True
-    gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 250.0, 500.0)
+    gentle_unwind_chunk_ladder_usd: tuple[float, ...] = (100.0, 75.0, 50.0)
     funding_harvest_unwind_chunk_usd: float = 100.0
     min_funding_harvest_unwind_profit_usd: float = 0.25
     toxic_unwind_enabled: bool = True

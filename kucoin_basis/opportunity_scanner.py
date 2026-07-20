@@ -124,6 +124,10 @@ def _decision_for_row(
     basis_percentile: float | None,
     exit_cost_pct: float | None,
     spot_hedge_route: str = "CROSS_MARGIN",
+    spot_entry_slippage_pct: float | None = None,
+    perp_entry_slippage_pct: float | None = None,
+    spot_exit_slippage_pct: float | None = None,
+    perp_exit_slippage_pct: float | None = None,
 ) -> tuple[str, str]:
     if config.approved_bases and pair.base not in config.approved_bases:
         return "REJECT", "base_not_whitelisted"
@@ -152,6 +156,20 @@ def _decision_for_row(
         return "REJECT", "expected_edge_below_threshold"
     if not round_trip_fillable:
         return "REJECT", "round_trip_not_fillable"
+    entry_slippage = (spot_entry_slippage_pct or 0.0) + (perp_entry_slippage_pct or 0.0)
+    if (
+        (spot_entry_slippage_pct or 0.0) > config.max_entry_leg_slippage_pct
+        or (perp_entry_slippage_pct or 0.0) > config.max_entry_leg_slippage_pct
+        or entry_slippage > config.max_combined_entry_slippage_pct
+    ):
+        return "REJECT", "entry_slippage_too_high"
+    exit_slippage = (spot_exit_slippage_pct or 0.0) + (perp_exit_slippage_pct or 0.0)
+    if (
+        (spot_exit_slippage_pct or 0.0) > config.max_exit_leg_slippage_pct
+        or (perp_exit_slippage_pct or 0.0) > config.max_exit_leg_slippage_pct
+        or exit_slippage > config.max_combined_exit_slippage_pct
+    ):
+        return "REJECT", "exit_slippage_too_high"
     if exit_cost_pct is not None and exit_cost_pct > config.max_entry_exit_cost_pct:
         return "REJECT", "exit_cost_too_high"
     if basis_observation_count >= config.min_basis_observations_for_stats:
@@ -418,6 +436,10 @@ def scan_pair(
                     basis_percentile=basis_stats.percentile,
                     exit_cost_pct=exit_cost_pct,
                     spot_hedge_route=spot_hedge_route,
+                    spot_entry_slippage_pct=estimate.spot_entry.slippage_pct,
+                    perp_entry_slippage_pct=estimate.perp_entry.slippage_pct,
+                    spot_exit_slippage_pct=estimate.spot_exit.slippage_pct,
+                    perp_exit_slippage_pct=estimate.perp_exit.slippage_pct,
                 )
             else:
                 decision, reason = "REJECT", "open_position_watchlist"

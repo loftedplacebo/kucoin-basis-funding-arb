@@ -135,6 +135,10 @@ class KucoinDryRunExecutor:
         private_client: KucoinPrivateClient,
         public_client: KucoinPublicClient | None = None,
         max_hedge_mismatch_bps: float = 25.0,
+        max_entry_leg_slippage_pct: float = 0.75,
+        max_exit_leg_slippage_pct: float = 0.75,
+        max_combined_entry_slippage_pct: float = 1.25,
+        max_combined_exit_slippage_pct: float = 1.25,
     ):
         mode = private_client.credentials.execution_mode.strip().lower().replace("-", "_")
         if mode not in {"validate", "dry_run"}:
@@ -144,6 +148,10 @@ class KucoinDryRunExecutor:
         self.private_client = private_client
         self.public_client = public_client or KucoinPublicClient()
         self.max_hedge_mismatch_bps = max_hedge_mismatch_bps
+        self.max_entry_leg_slippage_pct = max_entry_leg_slippage_pct
+        self.max_exit_leg_slippage_pct = max_exit_leg_slippage_pct
+        self.max_combined_entry_slippage_pct = max_combined_entry_slippage_pct
+        self.max_combined_exit_slippage_pct = max_combined_exit_slippage_pct
         self._borrow_enabled: dict[str, bool] | None = None
         self._isolated_borrow_enabled: dict[str, bool] = {}
 
@@ -152,11 +160,19 @@ class KucoinDryRunExecutor:
         cls,
         path: Path,
         max_hedge_mismatch_bps: float = 25.0,
+        max_entry_leg_slippage_pct: float = 0.75,
+        max_exit_leg_slippage_pct: float = 0.75,
+        max_combined_entry_slippage_pct: float = 1.25,
+        max_combined_exit_slippage_pct: float = 1.25,
     ) -> "KucoinDryRunExecutor":
         credentials = KucoinCredentials.from_env_file(path)
         return cls(
             KucoinPrivateClient(credentials),
             max_hedge_mismatch_bps=max_hedge_mismatch_bps,
+            max_entry_leg_slippage_pct=max_entry_leg_slippage_pct,
+            max_exit_leg_slippage_pct=max_exit_leg_slippage_pct,
+            max_combined_entry_slippage_pct=max_combined_entry_slippage_pct,
+            max_combined_exit_slippage_pct=max_combined_exit_slippage_pct,
         )
 
     def _margin_borrow_enabled(self, currency: str) -> bool:
@@ -346,6 +362,36 @@ class KucoinDryRunExecutor:
             "perp_slippage_pct": perp_execution.slippage_pct,
             "hedge_mismatch_bps": mismatch_bps,
         }
+        leg_limit = (
+            self.max_entry_leg_slippage_pct
+            if action == "ENTRY"
+            else self.max_exit_leg_slippage_pct
+        )
+        combined_limit = (
+            self.max_combined_entry_slippage_pct
+            if action == "ENTRY"
+            else self.max_combined_exit_slippage_pct
+        )
+        combined_slippage = spot_execution.slippage_pct + perp_execution.slippage_pct
+        if (
+            spot_execution.slippage_pct > leg_limit
+            or perp_execution.slippage_pct > leg_limit
+        ):
+            return self._rejected(
+                action,
+                row,
+                notional_usd,
+                "leg_slippage_too_high",
+                **common_fields,
+            )
+        if combined_slippage > combined_limit:
+            return self._rejected(
+                action,
+                row,
+                notional_usd,
+                "combined_slippage_too_high",
+                **common_fields,
+            )
 
         spot_payload = {
             "clientOid": uuid.uuid4().hex,

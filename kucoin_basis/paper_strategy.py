@@ -45,6 +45,12 @@ DISCRETIONARY_POST_FUNDING_EXIT_REASONS = {
     "capital_recycle_profitable_unwind",
 }
 
+FORCED_EXIT_REASONS = {
+    "pre_funding_reversal_toxic_unwind",
+    "post_funding_reversal_toxic_unwind",
+    "timed_exit_deadline",
+}
+
 
 def latest_opportunity_file(config: KucoinBasisConfig) -> Path:
     files = sorted(config.opportunities_dir.glob("kucoin_basis_opportunities_*.csv"))
@@ -661,13 +667,8 @@ def _choose_partial_close(
     return max(
         candidates,
         key=lambda candidate: (
-            (
-                candidate[2].net_pnl_ex_funding_usd / candidate[0] * 100
-                if require_ex_funding_profit
-                else candidate[2].net_pnl_pct
-            ),
-            candidate[2].net_pnl_ex_funding_usd if require_ex_funding_profit else candidate[2].net_pnl_usd,
-            -candidate[0],
+            candidate[0],
+            candidate[2].net_pnl_usd,
         ),
     )
 
@@ -859,25 +860,20 @@ def _choose_funding_harvest_close(
 ) -> tuple[float, OpportunityRow, ExitEstimate] | None:
     if position.funding_events_captured <= 0 or position.realised_funding_pnl_usd <= 0:
         return None
-    chunk = min(config.funding_harvest_unwind_chunk_usd, position.notional_usd)
-    if chunk <= 0:
-        return None
-    row = _choose_full_close_row(
+    return _choose_partial_close(
         rows,
         base=base,
         direction=direction,
-        notional_usd=chunk,
+        position=position,
+        position_notional_usd=min(
+            position.notional_usd, config.funding_harvest_unwind_chunk_usd
+        ),
+        config=config,
+        require_profitable=True,
+        require_ex_funding_profit=False,
+        min_profit_usd=config.min_funding_harvest_unwind_profit_usd,
+        max_exit_cost_pct=config.max_entry_exit_cost_pct,
     )
-    if row is None:
-        return None
-    estimate = _estimate_exit_chunk(position, row, config, chunk)
-    if estimate is None:
-        return None
-    if estimate.net_pnl_ex_funding_usd >= 0:
-        return None
-    if estimate.net_pnl_usd < config.min_funding_harvest_unwind_profit_usd:
-        return None
-    return chunk, row, estimate
 
 
 def _reduce_position(position: PaperPosition, chunk_notional_usd: float) -> None:
@@ -1384,6 +1380,36 @@ def run_paper_strategy_once(
                     exit_chunk,
                 )
                 if exit_estimate is None:
+                    continue
+
+                # The adapter has just repriced both legs from fresh depth. A
+                # stale scanner row must not turn a previously profitable exit
+                # into a realised loss, except for explicit risk/deadline exits.
+                if exit_estimate.net_pnl_usd <= 0 and reason not in FORCED_EXIT_REASONS:
+                    store.append_decision(
+                        {
+                            "timestamp_utc": format_datetime(utc_now()),
+                            "decision_type": "EXIT",
+                            "base": position.base,
+                            "direction": position.direction,
+                            "position_id": position.position_id,
+                            "opportunity_key": exit_row.opportunity_key,
+                            "allowed": "False",
+                            "reason": "fresh_exit_unprofitable",
+                            "notional_usd": f"{exit_chunk:.8f}",
+                            "expected_edge_pct": (
+                                ""
+                                if exit_row.expected_edge_pct is None
+                                else f"{exit_row.expected_edge_pct:.8f}"
+                            ),
+                            "estimated_net_pnl_usd": f"{exit_estimate.net_pnl_usd:.8f}",
+                            "row_timestamp_utc": format_datetime(exit_row.timestamp_utc),
+                            "row_age_seconds": f"{_row_age_seconds(exit_row, utc_now()):.3f}",
+                            "entry_basis_pct": f"{position.entry_basis_pct:.8f}",
+                            "current_basis_pct": f"{position.current_basis_pct:.8f}",
+                            "basis_improvement_pct": f"{_basis_improvement_pct(position):.8f}",
+                        }
+                    )
                     continue
 
             event_type = "CLOSE_POSITION" if exit_chunk >= position.notional_usd - 1e-8 else "PARTIAL_CLOSE"
