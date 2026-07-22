@@ -231,6 +231,43 @@ def test_gentle_unwind_chooses_largest_profitable_chunk():
     assert estimate.net_pnl_pct > 0
 
 
+def test_adverse_basis_exit_requires_extra_all_in_profit_buffer():
+    config = KucoinBasisConfig(
+        gentle_unwind_chunk_ladder_usd=(100.0,),
+        adverse_basis_exit_buffer_usd=0.25,
+    )
+    row = make_row(100.0, 0.01, 0.01)
+    position = make_position(
+        current_basis_pct=-1.2,
+        realised_funding_pnl_usd=2.0,
+    )
+
+    blocked = _choose_partial_close(
+        [row],
+        base="MIRA",
+        direction="SHORT_SPOT_LONG_PERP",
+        position=position,
+        position_notional_usd=position.notional_usd,
+        config=config,
+        require_adverse_basis_hurdle=True,
+    )
+    assert blocked is None
+
+    allowed = _choose_partial_close(
+        [row],
+        base="MIRA",
+        direction="SHORT_SPOT_LONG_PERP",
+        position=make_position(
+            current_basis_pct=-1.2,
+            realised_funding_pnl_usd=3.0,
+        ),
+        position_notional_usd=position.notional_usd,
+        config=config,
+        require_adverse_basis_hurdle=True,
+    )
+    assert allowed is not None
+
+
 def test_funding_accrues_without_current_opportunity_row():
     with TemporaryDirectory() as tmp:
         config = make_config(Path(tmp))

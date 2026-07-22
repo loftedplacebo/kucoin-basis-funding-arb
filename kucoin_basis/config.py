@@ -39,6 +39,9 @@ class KucoinBasisConfig:
     max_exit_leg_slippage_pct: float = 0.75
     max_combined_entry_slippage_pct: float = 1.25
     max_combined_exit_slippage_pct: float = 1.25
+    adverse_basis_exit_enabled: bool = True
+    adverse_basis_exit_loss_multiplier: float = 1.00
+    adverse_basis_exit_buffer_usd: float = 0.25
 
     max_orderbook_age_ms: int = 1_000
     max_basis_adverse_move_pct: float = 5.00

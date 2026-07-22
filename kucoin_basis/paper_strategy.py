@@ -303,6 +303,25 @@ def _basis_improvement_pct(position: PaperPosition) -> float:
     return position.entry_basis_pct - position.current_basis_pct
 
 
+def _adverse_basis_exit_hurdle_usd(
+    position: PaperPosition,
+    chunk_notional_usd: float,
+    config: KucoinBasisConfig,
+) -> float:
+    if not config.adverse_basis_exit_enabled or position.funding_events_captured <= 0:
+        return 0.0
+    adverse_move_pct = max(0.0, -_basis_improvement_pct(position))
+    if adverse_move_pct <= 0.0:
+        return 0.0
+    return (
+        chunk_notional_usd
+        * adverse_move_pct
+        / 100
+        * config.adverse_basis_exit_loss_multiplier
+        + config.adverse_basis_exit_buffer_usd
+    )
+
+
 def _basis_moved_adversely(position: PaperPosition, config: KucoinBasisConfig) -> bool:
     return _basis_improvement_pct(position) < -config.max_basis_adverse_move_pct
 
@@ -638,6 +657,7 @@ def _choose_partial_close(
     require_ex_funding_profit: bool = False,
     min_profit_usd: float = 0.0,
     max_exit_cost_pct: float | None = None,
+    require_adverse_basis_hurdle: bool = False,
 ) -> tuple[float, OpportunityRow, ExitEstimate] | None:
     candidates: list[tuple[float, OpportunityRow, ExitEstimate]] = []
     for chunk in config.gentle_unwind_chunk_ladder_usd:
@@ -655,6 +675,13 @@ def _choose_partial_close(
         if estimate is None:
             continue
         if max_exit_cost_pct is not None and _exit_slippage_cost_pct(row, config) > max_exit_cost_pct:
+            continue
+        if (
+            require_adverse_basis_hurdle
+            and estimate.net_pnl_usd < _adverse_basis_exit_hurdle_usd(
+                position, chunk, config
+            )
+        ):
             continue
         profit_to_test = estimate.net_pnl_ex_funding_usd if require_ex_funding_profit else estimate.net_pnl_usd
         if require_profitable and profit_to_test <= 0:
@@ -733,6 +760,8 @@ def _choose_unusually_attractive_close(
         return None
     estimate = _estimate_exit_chunk(position, row, config, chunk)
     if estimate is None:
+        return None
+    if estimate.net_pnl_usd < _adverse_basis_exit_hurdle_usd(position, chunk, config):
         return None
     hurdle_usd = min(
         config.unusually_attractive_unwind_profit_usd,
@@ -857,6 +886,7 @@ def _choose_funding_harvest_close(
     direction: str,
     position: PaperPosition,
     config: KucoinBasisConfig,
+    require_adverse_basis_hurdle: bool = False,
 ) -> tuple[float, OpportunityRow, ExitEstimate] | None:
     if position.funding_events_captured <= 0 or position.realised_funding_pnl_usd <= 0:
         return None
@@ -873,6 +903,7 @@ def _choose_funding_harvest_close(
         require_ex_funding_profit=False,
         min_profit_usd=config.min_funding_harvest_unwind_profit_usd,
         max_exit_cost_pct=config.max_entry_exit_cost_pct,
+        require_adverse_basis_hurdle=require_adverse_basis_hurdle,
     )
 
 
@@ -1055,6 +1086,7 @@ def run_paper_strategy_once(
                     require_ex_funding_profit=False,
                     min_profit_usd=config.min_funding_harvest_unwind_profit_usd,
                     max_exit_cost_pct=config.max_entry_exit_cost_pct,
+                    require_adverse_basis_hurdle=reason not in FORCED_EXIT_REASONS,
                 )
                 if capital_exit is not None:
                     selected_exit = capital_exit
@@ -1210,6 +1242,13 @@ def run_paper_strategy_once(
                 full_exit = (
                     full_exit_estimate is not None
                     and full_exit_estimate.net_pnl_ex_funding_usd >= full_exit_min_profit_usd
+                    and (
+                        reason in FORCED_EXIT_REASONS
+                        or full_exit_estimate.net_pnl_usd
+                        >= _adverse_basis_exit_hurdle_usd(
+                            position, position.notional_usd, config
+                        )
+                    )
                 )
             if selected_exit is None and full_exit:
                 exit_chunk = position.notional_usd
@@ -1224,6 +1263,7 @@ def run_paper_strategy_once(
                     config=config,
                     require_profitable=True,
                     require_ex_funding_profit=True,
+                    require_adverse_basis_hurdle=reason not in FORCED_EXIT_REASONS,
                 )
                 if partial is not None:
                     exit_chunk, exit_row, exit_estimate = partial
@@ -1241,6 +1281,7 @@ def run_paper_strategy_once(
                         direction=position.direction,
                         position=position,
                         config=config,
+                        require_adverse_basis_hurdle=reason not in FORCED_EXIT_REASONS,
                     )
                     if harvest is not None:
                         exit_chunk, exit_row, exit_estimate = harvest
