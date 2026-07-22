@@ -16,6 +16,10 @@ class KucoinBasisConfig:
     min_hold_funding_rate_pct: float = 0.30
     min_expected_edge_pct: float = 0.02
     min_minutes_before_funding: float = 15.0
+    preferred_entry_window_minutes: float = 120.0
+    max_entry_window_minutes: float = 240.0
+    reduced_late_entry_chunk_ladder_usd: tuple[float, ...] = (50.0, 75.0)
+    late_entry_requires_favourable_basis_trend: bool = True
     post_funding_entry_quarantine_minutes: float = 5.0
     funding_cycle_confirmation_observations: int = 2
     orderbook_monitor_interval_seconds: float = 60.0

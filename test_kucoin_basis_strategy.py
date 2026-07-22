@@ -376,6 +376,38 @@ def test_long_spot_does_not_require_margin_route():
     assert reason == "entry_rules_passed"
 
 
+def test_entry_timing_uses_direction_and_chunk_size():
+    pair = SymbolPair(base="MIRA", spot_symbol="MIRA-USDT", perp_symbol="MIRAUSDTM")
+    config = KucoinBasisConfig()
+
+    def decide(direction, minutes, notional, trend=None):
+        return _decision_for_row(
+            pair=pair,
+            config=config,
+            direction=direction,
+            funding_benefit_pct=1.0,
+            minutes_to_funding=minutes,
+            funding_interval_hours=8.0,
+            funding_cycle_confirmed=True,
+            expected_edge_pct=0.5,
+            round_trip_fillable=True,
+            basis_observation_count=0,
+            basis_percentile=None,
+            exit_cost_pct=0.1,
+            notional_usd=notional,
+            basis_trend_pct=trend,
+        )
+
+    assert decide("LONG_SPOT_SHORT_PERP", 180.0, 100.0, -0.1)[1] == "entry_size_restricted_by_timing"
+    assert decide("LONG_SPOT_SHORT_PERP", 180.0, 50.0, 0.1)[1] == "basis_trend_not_favourable_for_late_entry"
+    assert decide("LONG_SPOT_SHORT_PERP", 180.0, 50.0, -0.1) == (
+        "ENTER_CANDIDATE",
+        "entry_rules_passed",
+    )
+    assert decide("SHORT_SPOT_LONG_PERP", 180.0, 100.0, 0.1)[1] == "short_spot_entry_window_expired"
+    assert decide("LONG_SPOT_SHORT_PERP", 300.0, 50.0, -0.1)[1] == "entry_too_early"
+
+
 def test_new_funding_cycle_requires_two_observations():
     _FUNDING_CYCLE_OBSERVATIONS.clear()
     funding_time = datetime(2026, 7, 13, 0, 0, tzinfo=timezone.utc)

@@ -128,6 +128,8 @@ def _decision_for_row(
     perp_entry_slippage_pct: float | None = None,
     spot_exit_slippage_pct: float | None = None,
     perp_exit_slippage_pct: float | None = None,
+    notional_usd: float | None = None,
+    basis_trend_pct: float | None = None,
 ) -> tuple[str, str]:
     if config.approved_bases and pair.base not in config.approved_bases:
         return "REJECT", "base_not_whitelisted"
@@ -150,6 +152,23 @@ def _decision_for_row(
         return "REJECT", "funding_cycle_time_mismatch"
     if minutes_since_previous_funding < config.post_funding_entry_quarantine_minutes:
         return "REJECT", "post_funding_rollover_quarantine"
+    # Entry timing is evaluated per chunk. Existing positions can still appear
+    # on the watchlist, while new capital is constrained to the tested windows.
+    if notional_usd is not None:
+        if minutes_to_funding > config.max_entry_window_minutes:
+            return "REJECT", "entry_too_early"
+        if minutes_to_funding > config.preferred_entry_window_minutes:
+            if direction == "SHORT_SPOT_LONG_PERP":
+                return "REJECT", "short_spot_entry_window_expired"
+            if not any(
+                abs(notional_usd - chunk) < 1e-9
+                for chunk in config.reduced_late_entry_chunk_ladder_usd
+            ):
+                return "REJECT", "entry_size_restricted_by_timing"
+            if config.late_entry_requires_favourable_basis_trend and (
+                basis_trend_pct is None or basis_trend_pct >= 0.0
+            ):
+                return "REJECT", "basis_trend_not_favourable_for_late_entry"
     if not funding_cycle_confirmed:
         return "REJECT", "funding_cycle_unconfirmed"
     if expected_edge_pct is None or expected_edge_pct < config.min_expected_edge_pct:
@@ -376,6 +395,7 @@ def scan_pair(
 
     rows = []
     notionals = set(config.chunk_ladder_usd)
+    notionals.update(config.reduced_late_entry_chunk_ladder_usd)
     for direction_notionals in watched_by_direction.values():
         notionals.update(direction_notionals)
     for notional in sorted(notionals):
@@ -385,7 +405,13 @@ def scan_pair(
             spot_hedge_route = _spot_hedge_route(
                 direction, pair.base, spot_hedge_routes
             )
-            is_entry_chunk = notional in config.chunk_ladder_usd and notional <= config.max_chunk_notional_usd
+            is_entry_chunk = (
+                notional in (
+                    set(config.chunk_ladder_usd)
+                    | set(config.reduced_late_entry_chunk_ladder_usd)
+                )
+                and notional <= config.max_chunk_notional_usd
+            )
             is_entry_direction = direction in shortlisted_directions
             is_watch_row = direction in watched_by_direction and notional in watched_by_direction[direction]
             if not is_entry_chunk and not is_watch_row:
@@ -440,6 +466,8 @@ def scan_pair(
                     perp_entry_slippage_pct=estimate.perp_entry.slippage_pct,
                     spot_exit_slippage_pct=estimate.spot_exit.slippage_pct,
                     perp_exit_slippage_pct=estimate.perp_exit.slippage_pct,
+                    notional_usd=notional,
+                    basis_trend_pct=basis_stats.trend_pct,
                 )
             else:
                 decision, reason = "REJECT", "open_position_watchlist"
